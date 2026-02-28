@@ -136,6 +136,12 @@ curl -X POST http://localhost:3000/config \
   -d '{"shadowMode": false}'
 ```
 
+```bash
+curl -X POST http://localhost:5000/config \
+  -H "Content-Type: application/json" \
+  -d '{"targetAssets": "BTC,ETH,SOL,MATIC,DOGE,XRP"}'
+```
+
 ### Example: tail logs
 
 ```bash
