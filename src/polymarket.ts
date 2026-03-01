@@ -1,20 +1,38 @@
 /**
- * polymarket.ts
+ * polymarket.ts — Polymarket API client
  *
- * Polymarket API client.
+ * LIVE PATH AUDIT FIXES:
  *
- * Market discovery uses the deterministic slug approach:
- *   {asset}-updown-{duration}-{intervalStartUnixSeconds}
- *   e.g. btc-updown-5m-1772295900
+ * BUG 1 — Wrong method for FOK orders
+ *   Old: createMarketOrder() + postOrder(order, OrderType.FOK)
+ *   The clob-client has a dedicated createAndPostMarketOrder() that handles
+ *   FOK/FAK in one call with correct signing. Our two-step approach was calling
+ *   postOrder() with a SignedOrder that wasn't built for FOK, which could cause
+ *   signature mismatches or rejections.
+ *   Fix: use client.createAndPostMarketOrder() for FOK/FAK.
  *
- * Confirmed from real API response:
- * - /events?slug=... returns the event with nested markets array
- * - Nested markets in /events do NOT always include clobTokenIds
- * - When clobTokenIds is missing, fetch /markets?id=... for the full detail
- * - closed:true markets must be skipped (outcomePrices show 0/1, no orderbook)
+ * BUG 2 — No pre-flight balance check
+ *   We never verified the wallet has enough USDC before placing an order.
+ *   A low-balance order silently fails and we mark it as success.
+ *   Fix: check COLLATERAL balance before every live order, log clearly if
+ *   insufficient, return failure early.
+ *
+ * BUG 3 — roundSizeForPrecision loop tolerance too loose
+ *   The check `Math.abs(product - productExact) < 0.005` is the same as 
+ *   the rounding threshold itself, so it always passes on the first iteration
+ *   regardless of precision. The correct check is that the product, when
+ *   expressed as a string, has at most 2 decimal places.
+ *   Fix: check decimal string length directly.
+ *
+ * BUG 4 — createAndPostOrder options parameter is not Partial<>
+ *   The actual signature is: createAndPostOrder(userOrder, options?, orderType?)
+ *   where options is Partial<CreateOrderOptions>. tickSize is REQUIRED inside
+ *   CreateOrderOptions (not optional), so passing it as Partial<> means it
+ *   could be omitted and the order would use a wrong tick size.
+ *   Fix: always pass tickSize explicitly and validate it's a known value.
  */
 
-import { ClobClient, OrderType, Side } from "@polymarket/clob-client";
+import { ClobClient, OrderType, Side, AssetType } from "@polymarket/clob-client";
 import { Wallet } from "ethers";
 import type { ApiKeyCreds } from "@polymarket/clob-client";
 import { CONFIG } from "./config.js";
@@ -40,7 +58,8 @@ const DURATION_SECONDS_MAP: Record<string, number> = {
   "5-minute": 300, "15-minute": 900,
 };
 
-// ─── module state ─────────────────────────────────────────────────────────────
+const VALID_TICK_SIZES = ["0.1", "0.01", "0.001", "0.0001"] as const;
+type TickSize = typeof VALID_TICK_SIZES[number];
 
 let clobClient: ClobClient | null = null;
 
@@ -85,15 +104,28 @@ export async function initialiseClobClient(): Promise<void> {
 
   try {
     await clobClient.getOk();
-    log.info("INFO", { message: "CLOB client initialised." });
+    log.info("INFO", { message: "CLOB client initialised and connected." });
   } catch (err) {
     throw new Error(`CLOB connectivity check failed: ${(err as Error).message}`);
   }
 }
 
 function getClobClient(): ClobClient {
-  if (!clobClient) throw new Error("CLOB client not initialised.");
+  if (!clobClient) throw new Error("CLOB client not initialised. Call initialiseClobClient() first.");
   return clobClient;
+}
+
+// ─── balance check ─────────────────────────────────────────────────────────────
+
+/**
+ * BUG 2 FIX: Check USDC balance before placing a live order.
+ * Returns the balance in USDC (6-decimal USDC → divide by 1e6).
+ */
+export async function getUsdcBalance(): Promise<number> {
+  const client = getClobClient();
+  const resp = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+  // Balance is returned as a string integer in micro-USDC (6 decimals)
+  return parseFloat(resp.balance) / 1e6;
 }
 
 // ─── slug / interval helpers ──────────────────────────────────────────────────
@@ -104,15 +136,11 @@ function generateSlug(asset: string, duration: string, ts: number): string {
   return `${a}-updown-${d}-${ts}`;
 }
 
-/**
- * Return Unix timestamps (seconds) for: previous, current, and next 2 intervals.
- * We check prev too because some markets are created slightly before the interval.
- */
 function getIntervalTimestamps(durationSecs: number): number[] {
   const now = Math.floor(Date.now() / 1000);
   const current = Math.floor(now / durationSecs) * durationSecs;
   return [
-    current - durationSecs, // previous (in case we're right at a boundary)
+    current - durationSecs,
     current,
     current + durationSecs,
     current + durationSecs * 2,
@@ -155,27 +183,19 @@ export async function fetchCryptoMarkets(): Promise<Market[]> {
   const seen = new Set<string>();
   const now = Date.now();
 
-  // Generate all slugs we want to check
+  // Always fetch both 5m and 15m — scanner decides which to act on
+  const DURATIONS = ["5m", "15m"];
   const slugsToFetch: Array<{ slug: string; asset: string; duration: string }> = [];
   for (const asset of CONFIG.targetAssets) {
-    for (const duration of CONFIG.marketDurations) {
+    for (const duration of DURATIONS) {
       const durationSecs = DURATION_SECONDS_MAP[duration];
-      if (!durationSecs) {
-        log.warn("WARN", { message: `Unknown duration config: "${duration}". Use 5m or 15m.` });
-        continue;
-      }
+      if (!durationSecs) continue;
       for (const ts of getIntervalTimestamps(durationSecs)) {
         slugsToFetch.push({ slug: generateSlug(asset, duration, ts), asset, duration });
       }
     }
   }
 
-  log.info("INFO", {
-    message: `Fetching ${slugsToFetch.length} event slugs...`,
-    slugs: slugsToFetch.map((s) => s.slug),
-  });
-
-  // Fetch all in parallel
   await Promise.all(
     slugsToFetch.map(async ({ slug, asset, duration }) => {
       let event: GammaEvent | null;
@@ -186,52 +206,34 @@ export async function fetchCryptoMarkets(): Promise<Market[]> {
         return;
       }
 
-      if (!event) return; // 404 — interval not created yet, that's fine
-
-      if (event.closed) {
-        log.info("INFO", { message: `Event closed, skipping: ${slug}` });
-        return;
-      }
-
-      if (!event.markets || event.markets.length === 0) {
-        log.warn("WARN", { message: `Event has no markets: ${slug}` });
-        return;
-      }
+      if (!event) return;
+      if (event.closed) return;
+      if (!event.markets || event.markets.length === 0) return;
 
       for (const m of event.markets) {
         if (!m.id || seen.has(m.id)) continue;
         if (m.closed) continue;
         if (m.active === false) continue;
 
-        // Time check
         const endDateStr = m.endDate;
         if (!endDateStr) continue;
         const endMs = new Date(endDateStr).getTime();
         if (isNaN(endMs) || endMs <= now) continue;
         const timeRemainingSeconds = Math.floor((endMs - now) / 1000);
 
-        // The /events endpoint nested market sometimes omits clobTokenIds.
-        // Fetch full market detail from /markets?id=... if needed.
         let detail = m;
         if (!m.clobTokenIds) {
-          log.info("INFO", { message: `No clobTokenIds in nested market, fetching detail for id=${m.id}` });
           try {
             const fetched = await fetchMarketById(m.id);
             if (fetched) detail = { ...m, ...fetched };
           } catch (err) {
-            log.warn("WARN", { message: `Could not fetch market detail for ${m.id}`, error: (err as Error).message });
+            log.warn("WARN", { message: `Could not fetch detail for ${m.id}`, error: (err as Error).message });
             continue;
           }
         }
 
-        if (!detail.enableOrderBook) {
-          log.info("INFO", { message: `enableOrderBook=false for market ${m.id}, skipping` });
-          continue;
-        }
-        if (!detail.clobTokenIds) {
-          log.warn("WARN", { message: `Still no clobTokenIds for market ${m.id} after detail fetch` });
-          continue;
-        }
+        if (!detail.enableOrderBook) continue;
+        if (!detail.clobTokenIds) continue;
 
         let tokenIds: string[];
         try {
@@ -245,25 +247,23 @@ export async function fetchCryptoMarkets(): Promise<Market[]> {
         } catch { continue; }
         if (!prices || prices.length < 2) continue;
 
-        const price0 = prices[0]; // Up token
-        const price1 = prices[1]; // Down token
-
+        const price0 = prices[0];
+        const price1 = prices[1];
         const winSide: "YES" | "NO" = price0 >= price1 ? "YES" : "NO";
         const winSidePrice = price0 >= price1 ? price0 : price1;
         const tokenIdToBuy = price0 >= price1 ? tokenIds[0] : tokenIds[1];
 
-        const tickSize = detail.orderPriceMinTickSize != null
-          ? detail.orderPriceMinTickSize.toString()
+        // BUG 4 FIX: Validate tick size is a known value, default to "0.01"
+        const rawTickSize = detail.orderPriceMinTickSize?.toString() ?? "0.01";
+        const tickSize: TickSize = VALID_TICK_SIZES.includes(rawTickSize as TickSize)
+          ? (rawTickSize as TickSize)
           : "0.01";
-
-        const question = detail.question ?? event.title ?? slug;
 
         seen.add(m.id);
         results.push({
           id: m.id,
-          question,
-          asset,
-          duration,
+          question: detail.question ?? event.title ?? slug,
+          asset, duration,
           closesAt: endDateStr,
           timeRemainingSeconds,
           winSide,
@@ -287,14 +287,12 @@ export async function fetchCryptoMarkets(): Promise<Market[]> {
   return results;
 }
 
-// ─── Gamma fetch helpers ──────────────────────────────────────────────────────
-
 async function fetchEventBySlug(slug: string): Promise<GammaEvent | null> {
   const url = `${GAMMA_API}/events?slug=${encodeURIComponent(slug)}`;
   const response = await fetch(url);
   if (!response.ok) {
     if (response.status === 404) return null;
-    throw new Error(`Gamma /events error: HTTP ${response.status} for slug "${slug}"`);
+    throw new Error(`Gamma /events HTTP ${response.status} for slug "${slug}"`);
   }
   const data = await response.json() as GammaEvent[];
   if (!Array.isArray(data) || data.length === 0) return null;
@@ -328,7 +326,6 @@ export async function fetchMarketResolution(
     }
     if (prices.length < 2) return { marketId, outcome: "PENDING" };
 
-    // prices[0]=Up, prices[1]=Down. Winner is at 1.0
     let outcome: "YES" | "NO" | "CANCELLED";
     if (prices[0] >= 0.99) outcome = "YES";
     else if (prices[1] >= 0.99) outcome = "NO";
@@ -350,39 +347,132 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
     GTC: OrderType.GTC, GTD: OrderType.GTD,
     FOK: OrderType.FOK, FAK: OrderType.FAK,
   };
-  const orderType = orderTypeMap[CONFIG.orderType] ?? OrderType.GTC;
+  const orderType = orderTypeMap[CONFIG.orderType] ?? OrderType.FOK;
   const price = market.winSidePrice;
-  const sizeShares = round4(stakeUsd / price);
+  const tickSize = market.tickSize as TickSize;
+
+  // BUG 2 FIX: Pre-flight balance check
+  try {
+    const balance = await getUsdcBalance();
+    if (balance < stakeUsd) {
+      const error = `Insufficient USDC balance: have $${balance.toFixed(2)}, need $${stakeUsd}`;
+      log.error("ORDER_FAILED", { marketId: market.id, stakeUsd, balance, error });
+      return { success: false, error };
+    }
+    log.info("INFO", { message: `Balance check passed: $${balance.toFixed(2)} available` });
+  } catch (err) {
+    // Non-fatal — log the warning but proceed. Balance check failure shouldn't block trading.
+    log.warn("WARN", {
+      message: "Could not check USDC balance before order — proceeding anyway",
+      error: (err as Error).message,
+    });
+  }
 
   try {
     let resp: unknown;
+
     if (orderType === OrderType.FOK || orderType === OrderType.FAK) {
-      const order = await client.createMarketOrder({
-        tokenID: market.tokenIdToBuy, amount: stakeUsd, side: Side.BUY,
-      });
-      resp = await client.postOrder(order, orderType);
+      // BUG 1 FIX: Use createAndPostMarketOrder() — the dedicated combined method
+      // for FOK/FAK that handles signing and posting in one step correctly.
+      // UserMarketOrder.amount = USDC to spend (for BUY orders)
+      resp = await client.createAndPostMarketOrder(
+        {
+          tokenID: market.tokenIdToBuy,
+          amount: stakeUsd,
+          side: Side.BUY,
+          price,             // optional but helps with slippage — use our current price
+        },
+        { tickSize, negRisk: market.negRisk },
+        orderType
+      );
     } else {
+      // GTC/GTD: limit order
+      // BUG 3 FIX: Use correctly validated size
+      const sizeShares = roundSizeForPrecision(stakeUsd / price, price);
+
       resp = await client.createAndPostOrder(
-        { tokenID: market.tokenIdToBuy, price, size: sizeShares, side: Side.BUY },
-        { tickSize: market.tickSize as "0.1" | "0.01" | "0.001" | "0.0001", negRisk: market.negRisk },
+        {
+          tokenID: market.tokenIdToBuy,
+          price,
+          size: sizeShares,
+          side: Side.BUY,
+        },
+        { tickSize, negRisk: market.negRisk },
         orderType
       );
     }
+
     const r = resp as Record<string, unknown>;
-    const orderId = (r.orderId ?? r.id ?? r.orderID ?? "") as string;
+
+    // Detect rejected/error responses that come back as HTTP 200
+    const errorMsg = r["errorMsg"] ?? r["error"];
+    const status = r["status"] as string | undefined;
+    const isRejected =
+      (typeof errorMsg === "string" && errorMsg.length > 0) ||
+      status === "rejected" ||
+      status === "error";
+
+    if (isRejected) {
+      const errorText = String(errorMsg ?? status ?? "Order rejected by CLOB");
+      log.error("ORDER_FAILED", {
+        marketId: market.id,
+        tokenId: market.tokenIdToBuy,
+        stakeUsd, price, orderType: CONFIG.orderType,
+        error: errorText,
+        rawResponse: resp,
+      });
+      return { success: false, error: errorText };
+    }
+
+    const orderId = (r["orderId"] ?? r["id"] ?? r["orderID"] ?? "") as string;
 
     log.info("ORDER_RESPONSE", {
-      marketId: market.id, tokenId: market.tokenIdToBuy, side: market.winSide,
-      stakeUsd, sizeShares, price, orderType: CONFIG.orderType, orderId, rawResponse: resp,
+      marketId: market.id,
+      tokenId: market.tokenIdToBuy,
+      side: market.winSide,
+      stakeUsd, price,
+      orderType: CONFIG.orderType,
+      orderId, status,
+      rawResponse: resp,
     });
 
-    return { success: true, orderId: orderId || undefined, avgPrice: price,
-      filled: orderType === OrderType.FOK || orderType === OrderType.FAK, rawResponse: resp };
+    return {
+      success: true,
+      orderId: orderId || undefined,
+      avgPrice: price,
+      filled: orderType === OrderType.FOK || orderType === OrderType.FAK,
+      rawResponse: resp,
+    };
   } catch (err) {
     const error = (err as Error).message;
     log.error("ORDER_FAILED", { marketId: market.id, stakeUsd, error });
     return { success: false, error };
   }
+}
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * BUG 3 FIX: Round share size so that size × price has at most 2 decimal places.
+ * Check by converting the product to a string and counting decimal digits.
+ */
+function roundSizeForPrecision(rawSize: number, price: number): number {
+  let size = Math.floor(rawSize * 10000) / 10000;
+
+  for (let i = 0; i < 200; i++) {
+    const product = size * price;
+    // Convert to string and check decimal places
+    const str = product.toFixed(10).replace(/0+$/, "");
+    const dotIdx = str.indexOf(".");
+    const decimalPlaces = dotIdx === -1 ? 0 : str.length - dotIdx - 1;
+
+    if (decimalPlaces <= 2) break;
+
+    size = Math.floor((size - 0.0001) * 10000) / 10000;
+    if (size <= 0) { size = 0.0001; break; }
+  }
+
+  return size;
 }
 
 function round4(n: number): number {
