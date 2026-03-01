@@ -1,22 +1,14 @@
 /**
- * api.ts
- *
- * Express REST API for local bot control.
- * Localhost only — no authentication needed.
+ * api.ts — Express REST API for local bot control.
+ * Localhost only — no authentication.
  *
  * Endpoints:
- *   GET  /status                   Bot state, slots, active bets, P&L summary
+ *   GET  /status                   Full state, P&L summary, per-rule breakdown
  *   GET  /config                   Current config (sensitive fields redacted)
  *   POST /config                   Hot-update mutable config fields
- *   POST /pause                    Pause new bets
- *   POST /resume                   Resume bot
- *   GET  /logs?tail=N&cat=trades   Last N lines from trades|errors|system log
+ *   POST /pause / /resume          Pause/resume new bets
+ *   GET  /logs?tail=N&cat=...      Last N log lines
  *   GET  /logs/files               List all log files
- *
- * P&L note:
- *   netPnl = totalProfitExtracted + unrealisedPnl
- *   unrealisedPnl = (currentTotalBalance - initialCapital)
- *   initialCapital = numSlots × slotInitialUsd
  */
 
 import express, { Request, Response } from "express";
@@ -33,16 +25,18 @@ export function startApiServer(): void {
   // ── GET /status ─────────────────────────────────────────────────────────────
   app.get("/status", (_req: Request, res: Response) => {
     const snapshot = getSnapshot();
-    const summary = getSummary();
+    const summary  = getSummary();
 
-    // Net P&L calculation:
-    //   initialCapital  = how much money the bot started with across all slots
-    //   currentBalance  = what's sitting in slots right now (unrealised)
-    //   profitExtracted = profits already pulled out and "banked"
-    //   netPnl          = extracted + unrealised gain/loss in current balances
-    const initialCapital = round2(CONFIG.numSlots * CONFIG.slotInitialUsd);
-    const unrealisedPnl = round2(summary.totalBalance - initialCapital);
-    const netPnl = round2(summary.totalProfitExtracted + unrealisedPnl);
+    // Net P&L:
+    //   netPnl = profitExtracted (banked wins) - totalLost (stakes destroyed by losses)
+    //          + unrealisedGain (win profit sitting in slots above initial seeding)
+    //
+    // Note: unrealisedGain only counts profit above initial — if slots are at their
+    // starting balance, unrealisedGain = 0. It does NOT include compounded gains
+    // that haven't been extracted yet above threshold (those appear in currentBalance).
+    const initialCapital  = round2(CONFIG.numSlots * CONFIG.slotInitialUsd);
+    const unrealisedGain  = round2(Math.max(0, summary.totalBalance - initialCapital));
+    const netPnl          = round2(summary.totalProfitExtracted - summary.totalLost + unrealisedGain);
 
     const activeBets = getActiveBets().map((b) => ({
       betId: b.betId,
@@ -59,22 +53,39 @@ export function startApiServer(): void {
       closesAt: b.market.closesAt,
       orderId: b.orderId,
       shadow: b.shadow,
+      rule: b.rule,
     }));
 
     res.json({
-      timestamp: new Date().toISOString(),
+      timestamp:  new Date().toISOString(),
       shadowMode: CONFIG.shadowMode,
-      paused: isPausedState(),
-      pnl: {
+      paused:     isPausedState(),
+
+      summary: {
+        // Slots
+        totalSlots:  summary.totalSlots,
+        activeSlots: summary.activeSlots,
+        idleSlots:   summary.idleSlots,
+
+        // P&L
         initialCapital,
-        currentBalance: summary.totalBalance,
-        profitExtracted: summary.totalProfitExtracted,
-        unrealisedPnl,
+        currentBalance:       summary.totalBalance,
+        profitExtracted:      summary.totalProfitExtracted,
+        totalLost:            summary.totalLost,
+        unrealisedGain,
         netPnl,
-        totalWins: summary.totalWins,
-        totalLosses: summary.totalLosses,
-        winRate: summary.winRate,
+
+        // Overall trade stats
+        totalWins:    summary.totalWins,
+        totalLosses:  summary.totalLosses,
+        totalTrades:  summary.totalTrades,
+        winRate:      summary.winRate,
+        avgWinAmount: summary.avgWinAmount,
+
+        // Per-rule breakdown (5m / 15m / fallback)
+        byRule: summary.byRule,
       },
+
       slots: snapshot,
       activeBets,
     });
@@ -85,9 +96,9 @@ export function startApiServer(): void {
     const { privateKey, polyApiKey, polySecret, polyPassphrase, ...safe } = CONFIG;
     res.json({
       ...safe,
-      privateKey: "[REDACTED]",
-      polyApiKey: polyApiKey ? "[SET]" : "[NOT SET]",
-      polySecret: polySecret ? "[SET]" : "[NOT SET]",
+      privateKey:     "[REDACTED]",
+      polyApiKey:     polyApiKey     ? "[SET]" : "[NOT SET]",
+      polySecret:     polySecret     ? "[SET]" : "[NOT SET]",
       polyPassphrase: polyPassphrase ? "[SET]" : "[NOT SET]",
     });
   });
@@ -107,18 +118,28 @@ export function startApiServer(): void {
       res.status(400).json({
         error: "No recognised mutable config keys in body.",
         mutableKeys: [
-          "scanIntervalMs", "priceRangeMin", "priceRangeMax",
-          "fallbackTimeRemainingS", "fallbackMaxPrice", "orderType",
+          "scanIntervalMs",
+          "enable5m", "enable15m", "enableFallback",
+          "priceRangeMin5m", "priceRangeMax5m",
+          "priceRangeMin15m", "priceRangeMax15m",
+          "maxTimeRemaining5m", "maxTimeRemaining15m",
+          "fallbackTimeRemainingS", "fallbackMaxPrice",
+          "orderType",
           "numSlots", "slotInitialUsd", "slotProfitMultiplier",
-          "shadowMode", "targetAssets", "marketDurations",
+          "shadowMode", "targetAssets",
         ],
-        example: { priceRangeMin: 0.92, shadowMode: false, targetAssets: ["BTC", "ETH"] },
+        examples: {
+          "disable 5m markets":           { enable5m: false },
+          "only use fallback":            { enable5m: false, enable15m: false, enableFallback: true },
+          "set 15m price range":          { priceRangeMin15m: 0.96, priceRangeMax15m: 0.99 },
+          "set max time remaining (5m)":  { maxTimeRemaining5m: 120 },
+          "set max time remaining (15m)": { maxTimeRemaining15m: 300 },
+        },
       });
       return;
     }
 
     if (updated.length > 0) {
-      // Build a map of key → new coerced value for the log
       const newValues: Record<string, unknown> = {};
       for (const k of updated) newValues[k] = (CONFIG as unknown as Record<string, unknown>)[k];
       log.info("CONFIG_UPDATED", { updatedKeys: updated, newValues });
@@ -128,49 +149,35 @@ export function startApiServer(): void {
       success: updated.length > 0,
       updated,
       errors,
-      message: updated.length > 0
-        ? `Updated: ${updated.join(", ")}`
-        : "No fields were updated.",
+      message: updated.length > 0 ? `Updated: ${updated.join(", ")}` : "No fields updated.",
     });
   });
 
   // ── POST /pause ──────────────────────────────────────────────────────────────
   app.post("/pause", (_req: Request, res: Response) => {
-    if (isPausedState()) {
-      res.json({ message: "Already paused." });
-      return;
-    }
+    if (isPausedState()) { res.json({ message: "Already paused." }); return; }
     pauseScanner();
     res.json({ success: true, message: "Paused. Active bets will still resolve." });
   });
 
   // ── POST /resume ─────────────────────────────────────────────────────────────
   app.post("/resume", (_req: Request, res: Response) => {
-    if (!isPausedState()) {
-      res.json({ message: "Already running." });
-      return;
-    }
+    if (!isPausedState()) { res.json({ message: "Already running." }); return; }
     resumeScanner();
     res.json({ success: true, message: "Resumed." });
   });
 
   // ── GET /logs ────────────────────────────────────────────────────────────────
   app.get("/logs", (req: Request, res: Response) => {
-    const tailParam = req.query["tail"];
-    const catParam = req.query["cat"] as string | undefined;
-    const n = tailParam ? parseInt(tailParam as string, 10) : 100;
-
+    const n = parseInt((req.query["tail"] as string) ?? "100", 10);
     if (isNaN(n) || n < 1 || n > 10000) {
       res.status(400).json({ error: "tail must be 1–10000." });
       return;
     }
-
     const validCategories = ["trades", "errors", "system"] as const;
     type LogCat = typeof validCategories[number];
-    const category: LogCat = validCategories.includes(catParam as LogCat)
-      ? (catParam as LogCat)
-      : "trades";
-
+    const cat = (req.query["cat"] as string | undefined) ?? "trades";
+    const category: LogCat = validCategories.includes(cat as LogCat) ? (cat as LogCat) : "trades";
     const entries = log.tail(n, category);
     res.json({ category, count: entries.length, entries });
   });
@@ -180,7 +187,6 @@ export function startApiServer(): void {
     res.json({ files: log.listFiles() });
   });
 
-  // ── start ────────────────────────────────────────────────────────────────────
   app.listen(CONFIG.apiPort, "127.0.0.1", () => {
     log.info("BOT_STARTED", {
       message: `Control panel on http://127.0.0.1:${CONFIG.apiPort}`,
@@ -197,6 +203,4 @@ export function startApiServer(): void {
   });
 }
 
-function round2(n: number): number {
-  return Math.round(n * 100) / 100;
-}
+function round2(n: number): number { return Math.round(n * 100) / 100; }
