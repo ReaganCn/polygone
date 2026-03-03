@@ -32,6 +32,7 @@ export type LogEvent =
   | "RESOLUTION_WIN"
   | "RESOLUTION_LOSS"
   | "RESOLUTION_ERROR"
+  | "REDEEM_UNCAUGHT"
   // Shadow mode → trades log
   | "SHADOW_BET_SIMULATED"
   | "SHADOW_RESOLUTION_WIN"
