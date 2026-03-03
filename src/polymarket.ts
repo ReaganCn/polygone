@@ -18,7 +18,7 @@
  *   insufficient, return failure early.
  *
  * BUG 3 — roundSizeForPrecision loop tolerance too loose
- *   The check `Math.abs(product - productExact) < 0.005` is the same as 
+ *   The check `Math.abs(product - productExact) < 0.005` is the same as
  *   the rounding threshold itself, so it always passes on the first iteration
  *   regardless of precision. The correct check is that the product, when
  *   expressed as a string, has at most 2 decimal places.
@@ -30,6 +30,9 @@
  *   CreateOrderOptions (not optional), so passing it as Partial<> means it
  *   could be omitted and the order would use a wrong tick size.
  *   Fix: always pass tickSize explicitly and validate it's a known value.
+ *
+ * CHANGE (redeemer): conditionId is now mapped from the Gamma API response
+ *   into every Market object so that redeemer.ts can call redeemPositions().
  */
 
 import { ClobClient, OrderType, Side, AssetType } from "@polymarket/clob-client";
@@ -115,7 +118,7 @@ function getClobClient(): ClobClient {
   return clobClient;
 }
 
-// ─── balance check ─────────────────────────────────────────────────────────────
+// ─── balance check ────────────────────────────────────────────────────────────
 
 /**
  * BUG 2 FIX: Check USDC balance before placing a live order.
@@ -124,7 +127,6 @@ function getClobClient(): ClobClient {
 export async function getUsdcBalance(): Promise<number> {
   const client = getClobClient();
   const resp = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-  // Balance is returned as a string integer in micro-USDC (6 decimals)
   return parseFloat(resp.balance) / 1e6;
 }
 
@@ -183,7 +185,6 @@ export async function fetchCryptoMarkets(): Promise<Market[]> {
   const seen = new Set<string>();
   const now = Date.now();
 
-  // Always fetch both 5m and 15m — scanner decides which to act on
   const DURATIONS = ["5m", "15m"];
   const slugsToFetch: Array<{ slug: string; asset: string; duration: string }> = [];
   for (const asset of CONFIG.targetAssets) {
@@ -235,6 +236,13 @@ export async function fetchCryptoMarkets(): Promise<Market[]> {
         if (!detail.enableOrderBook) continue;
         if (!detail.clobTokenIds) continue;
 
+        // conditionId is required for redemption. Skip markets that don't have it
+        // (should never happen for real Polymarket markets, but guard anyway).
+        if (!detail.conditionId) {
+          log.warn("WARN", { message: `Market ${m.id} has no conditionId — skipping`, slug });
+          continue;
+        }
+
         let tokenIds: string[];
         try {
           tokenIds = JSON.parse(detail.clobTokenIds) as string[];
@@ -262,6 +270,7 @@ export async function fetchCryptoMarkets(): Promise<Market[]> {
         seen.add(m.id);
         results.push({
           id: m.id,
+          conditionId: detail.conditionId,  // ← mapped from Gamma API response
           question: detail.question ?? event.title ?? slug,
           asset, duration,
           closesAt: endDateStr,
@@ -361,7 +370,6 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
     }
     log.info("INFO", { message: `Balance check passed: $${balance.toFixed(2)} available` });
   } catch (err) {
-    // Non-fatal — log the warning but proceed. Balance check failure shouldn't block trading.
     log.warn("WARN", {
       message: "Could not check USDC balance before order — proceeding anyway",
       error: (err as Error).message,
@@ -372,15 +380,13 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
     let resp: unknown;
 
     if (orderType === OrderType.FOK || orderType === OrderType.FAK) {
-      // BUG 1 FIX: Use createAndPostMarketOrder() — the dedicated combined method
-      // for FOK/FAK that handles signing and posting in one step correctly.
-      // UserMarketOrder.amount = USDC to spend (for BUY orders)
+      // BUG 1 FIX: Use createAndPostMarketOrder() for FOK/FAK
       resp = await client.createAndPostMarketOrder(
         {
           tokenID: market.tokenIdToBuy,
           amount: stakeUsd,
           side: Side.BUY,
-          price,             // optional but helps with slippage — use our current price
+          price,
         },
         { tickSize, negRisk: market.negRisk },
         orderType
@@ -404,7 +410,6 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
 
     const r = resp as Record<string, unknown>;
 
-    // Detect rejected/error responses that come back as HTTP 200
     const errorMsg = r["errorMsg"] ?? r["error"];
     const status = r["status"] as string | undefined;
     const isRejected =
@@ -454,14 +459,12 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
 
 /**
  * BUG 3 FIX: Round share size so that size × price has at most 2 decimal places.
- * Check by converting the product to a string and counting decimal digits.
  */
 function roundSizeForPrecision(rawSize: number, price: number): number {
   let size = Math.floor(rawSize * 10000) / 10000;
 
   for (let i = 0; i < 200; i++) {
     const product = size * price;
-    // Convert to string and check decimal places
     const str = product.toFixed(10).replace(/0+$/, "");
     const dotIdx = str.indexOf(".");
     const decimalPlaces = dotIdx === -1 ? 0 : str.length - dotIdx - 1;
