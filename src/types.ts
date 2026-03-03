@@ -6,6 +6,7 @@ export type BetRule = "5m" | "15m" | "fallback";
 
 export interface Market {
   id: string;
+  conditionId: string; 
   question: string;
   asset: string;
   /** Canonical duration key: "5m" | "15m" */
