@@ -24,10 +24,10 @@ async function main(): Promise<void> {
     message: "Polymarket crypto up/down bot starting...",
     shadowMode: CONFIG.shadowMode,
     targetAssets: CONFIG.targetAssets,
-    marketDurations: CONFIG.marketDurations,
-    priceRange: { min: CONFIG.priceRangeMin, max: CONFIG.priceRangeMax },
+    marketDurations: CONFIG.maxTimeRemaining15m,
+    priceRange: { min: CONFIG.priceRangeMin15m, max: CONFIG.priceRangeMax15m },
     fallback: {
-      timeRemainingS: CONFIG.fallbackTimeRemainingS,
+      timeRemainingS: CONFIG.fallbackTimeRemaining15m,
       maxPrice: CONFIG.fallbackMaxPrice,
     },
     numSlots: CONFIG.numSlots,
