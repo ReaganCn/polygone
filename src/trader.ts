@@ -1,6 +1,10 @@
 /**
  * trader.ts — Main orchestrator.
  * Now receives BetRule from scanner and threads it through to slot accounting.
+ *
+ * CHANGE (redeemer integration):
+ *   After every live RESOLUTION_WIN, redeemAfterWin() is called so the winning
+ *   tokens are immediately converted back to spendable USDC.
  */
 
 import { CONFIG } from "./config.js";
@@ -9,6 +13,7 @@ import { placeOrder, fetchMarketResolution } from "./polymarket.js";
 import { getIdleSlot, assignBet, recordWin, recordLoss } from "./slots.js";
 import { trackMarket, untrackMarket } from "./scanner.js";
 import { simulateBet } from "./shadow.js";
+import { redeemAfterWin } from "./redeemer.js"; // ← NEW
 import type { Market, ActiveBet, BetRule } from "./types.js";
 
 const activeBetsByMarketId = new Map<string, ActiveBet>();
@@ -72,6 +77,7 @@ export function handleWsResolution(
 
   if (won) {
     const payoutUsd = Math.round((bet.stakeUsd / bet.priceAtBet) * 100) / 100;
+
     log.info(bet.shadow ? "SHADOW_RESOLUTION_WIN" : "RESOLUTION_WIN", {
       source: "websocket",
       betId: bet.betId, slotId: bet.slotId, orderId: bet.orderId,
@@ -81,7 +87,23 @@ export function handleWsResolution(
       profitUsd: Math.round((payoutUsd - bet.stakeUsd) * 100) / 100,
       priceAtBet: bet.priceAtBet, rule: bet.rule,
     });
+
     recordWin(bet.slotId, payoutUsd);
+
+    // ── NEW: trigger redemption so USDC becomes spendable immediately ─────────
+    // Fire-and-forget — we don't await because the slot can already start
+    // tracking the next bet. Redemption confirmation is logged by redeemer.ts.
+    if (!bet.shadow) {
+      redeemAfterWin(bet.market.conditionId, bet.market.question).catch(
+        (err) =>
+          log.error("REDEEM_UNCAUGHT", {
+            marketId,
+            error: (err as Error).message,
+          })
+      );
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
   } else {
     log.info(bet.shadow ? "SHADOW_RESOLUTION_LOSS" : "RESOLUTION_LOSS", {
       source: "websocket",
@@ -180,6 +202,7 @@ function startFallbackResolutionWatcher(bet: ActiveBet): void {
           recordLoss(bet.slotId);
           untrackMarket(bet.market.id);
         } else {
+          // handleWsResolution already calls redeemAfterWin internally
           handleWsResolution(bet.market.id, "", resolution.outcome);
         }
       } catch (err) {
