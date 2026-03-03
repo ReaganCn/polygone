@@ -9,6 +9,11 @@
  *     A bet is only placed when timeRemaining <= this value.
  *   - Toggle each market type on/off: ENABLE_5M, ENABLE_15M, ENABLE_FALLBACK
  *   - Fallback is now a named rule (not just a time-based filter)
+ *
+ * CHANGE (redeemer):
+ *   Added builder program credentials: polyBuilderApiKey, polyBuilderSecret,
+ *   polyBuilderPassphrase, polygonRpcUrl.
+ *   These are read from env but NOT exposed via POST /config (non-mutable).
  */
 
 import "dotenv/config";
@@ -62,6 +67,15 @@ export interface BotConfig {
   polySecret: string;
   polyPassphrase: string;
 
+  // ── Builder program credentials (required for auto-redemption) ─────────────
+  // Generate at: polymarket.com/settings?tab=builder
+  polyBuilderApiKey: string;
+  polyBuilderSecret: string;
+  polyBuilderPassphrase: string;
+  // RPC endpoint for Polygon — any public or private node works
+  polygonRpcUrl: string;
+  // ──────────────────────────────────────────────────────────────────────────
+
   // Scanning
   scanIntervalMs: number;
   targetAssets: string[];
@@ -78,14 +92,12 @@ export interface BotConfig {
   priceRangeMax15m: number;
 
   // Max time remaining to enter a trade (seconds) — per duration
-  // A bet is only placed when timeRemainingSeconds <= this value.
-  // Default: half of each market's total duration (150s for 5m, 450s for 15m).
   maxTimeRemaining5m: number;
   maxTimeRemaining15m: number;
 
-  // Fallback rule: triggers near expiry regardless of price, per duration
-  fallbackTimeRemaining5m: number;   // default 40s  (last ~13% of a 5m market)
-  fallbackTimeRemaining15m: number;  // default 120s (last ~13% of a 15m market)
+  // Fallback rule
+  fallbackTimeRemaining5m: number;
+  fallbackTimeRemaining15m: number;
   fallbackMinPrice: number;
   fallbackMaxPrice: number;
 
@@ -125,6 +137,13 @@ function loadConfig(): BotConfig {
     polySecret: optionalEnv("POLY_SECRET", ""),
     polyPassphrase: optionalEnv("POLY_PASSPHRASE", ""),
 
+    // Builder credentials — optionalEnv so the bot still boots in shadow mode
+    // without them. redeemer.ts will throw clearly at runtime if live mode needs them.
+    polyBuilderApiKey:     optionalEnv("POLY_BUILDER_API_KEY", ""),
+    polyBuilderSecret:     optionalEnv("POLY_BUILDER_SECRET", ""),
+    polyBuilderPassphrase: optionalEnv("POLY_BUILDER_PASSPHRASE", ""),
+    polygonRpcUrl:         optionalEnv("POLYGON_RPC_URL", "https://polygon-rpc.com"),
+
     scanIntervalMs: parseInt_("SCAN_INTERVAL_MS", 4000),
     targetAssets: parseList("TARGET_ASSETS", ["BTC", "ETH", "SOL"]),
 
@@ -132,18 +151,14 @@ function loadConfig(): BotConfig {
     enable15m:      parseBool("ENABLE_15M", true),
     enableFallback: parseBool("ENABLE_FALLBACK", true),
 
-    // 5m price range: default slightly wider (more volatile short windows)
     priceRangeMin5m:  parseFloat_("PRICE_RANGE_MIN_5M",  0.91),
     priceRangeMax5m:  parseFloat_("PRICE_RANGE_MAX_5M",  0.99),
-    // 15m price range: default tighter (more predictable longer windows)
     priceRangeMin15m: parseFloat_("PRICE_RANGE_MIN_15M", 0.96),
     priceRangeMax15m: parseFloat_("PRICE_RANGE_MAX_15M", 0.99),
 
-    // Max time remaining to enter: defaults to half of each market's duration
-    maxTimeRemaining5m:  parseInt_("MAX_TIME_REMAINING_5M",  150), // half of 300s
-    maxTimeRemaining15m: parseInt_("MAX_TIME_REMAINING_15M", 450), // half of 900s
+    maxTimeRemaining5m:  parseInt_("MAX_TIME_REMAINING_5M",  150),
+    maxTimeRemaining15m: parseInt_("MAX_TIME_REMAINING_15M", 450),
 
-    // Fallback rule (applies to any duration when near expiry)
     fallbackTimeRemaining5m:  parseInt_("FALLBACK_TIME_REMAINING_5M",  40),
     fallbackTimeRemaining15m: parseInt_("FALLBACK_TIME_REMAINING_15M", 120),
     fallbackMinPrice:         parseFloat_("FALLBACK_MIN_PRICE", 0.0),
