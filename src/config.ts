@@ -175,7 +175,7 @@ function loadConfig(): BotConfig {
 
     // Stop loss Config
     stopLossEnabled:      parseBool("STOP_LOSS_ENABLED", false),
-    stopLossTriggerPrice: parseFloat_("STOP_LOSS_TRIGGER_PRICE", 0.40),
+    stopLossTriggerPrice: parseFloat_("STOP_LOSS_TRIGGER_PRICE", 0.49),
     stopLossLimitPrice:   parseFloat_("STOP_LOSS_LIMIT_PRICE",   0.05),
 
     orderType: orderTypeRaw as OrderTypeOption,
