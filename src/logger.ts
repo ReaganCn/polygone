@@ -32,7 +32,17 @@ export type LogEvent =
   | "RESOLUTION_WIN"
   | "RESOLUTION_LOSS"
   | "RESOLUTION_ERROR"
+  // Redeem
   | "REDEEM_UNCAUGHT"
+  | "REDEEM_SUBMITTING"
+  | "REDEEM_CONFIRMED"
+  | "REDEEM_FAILED"
+  | "REDEEM_SKIPPED_SHADOW"
+  | "REDEEM_SWEEP_FETCH_ERROR"
+  | "REDEEM_SWEEP_ERROR"
+  | "REDEEM_SWEEP_NONE"
+  | "REDEEM_SWEEP_START"
+  | "REDEEM_SWEEP_DONE"
   // Shadow mode → trades log
   | "SHADOW_BET_SIMULATED"
   | "SHADOW_RESOLUTION_WIN"
@@ -41,6 +51,7 @@ export type LogEvent =
   | "SLOT_ASSIGNED"
   | "SLOT_WIN_COMPOUND"
   | "SLOT_LOSS_RESET"
+  | "SLOT_STOP_LOSS"
   | "SLOT_PROFIT_EXTRACTED"
   | "SLOT_STATE_SNAPSHOT"
   // Scanner → system log
@@ -72,8 +83,11 @@ const TRADE_EVENTS = new Set<LogEvent>([
   "BET_PLACED", "BET_QUEUED", "BET_SKIPPED_NO_SLOT", "ORDER_RESPONSE", "ORDER_FAILED",
   "RESOLUTION_WIN", "RESOLUTION_LOSS", "RESOLUTION_ERROR",
   "SHADOW_BET_SIMULATED", "SHADOW_RESOLUTION_WIN", "SHADOW_RESOLUTION_LOSS",
-  "SLOT_ASSIGNED", "SLOT_WIN_COMPOUND", "SLOT_LOSS_RESET",
+  "SLOT_ASSIGNED", "SLOT_WIN_COMPOUND", "SLOT_LOSS_RESET", "SLOT_STOP_LOSS",
   "SLOT_PROFIT_EXTRACTED", "SLOT_STATE_SNAPSHOT",
+  "REDEEM_UNCAUGHT", "REDEEM_SUBMITTING", "REDEEM_CONFIRMED", "REDEEM_FAILED",
+  "REDEEM_SKIPPED_SHADOW", "REDEEM_SWEEP_FETCH_ERROR", "REDEEM_SWEEP_ERROR",
+  "REDEEM_SWEEP_NONE", "REDEEM_SWEEP_START", "REDEEM_SWEEP_DONE",
 ]);
 
 const SYSTEM_EVENTS = new Set<LogEvent>([
@@ -82,14 +96,24 @@ const SYSTEM_EVENTS = new Set<LogEvent>([
   "RESOLUTION_POLLING", "INFO",
 ]);
 
-// Events always shown on console
+// Events always shown on console regardless of LOG_VERBOSE
 const CONSOLE_EVENTS = new Set<LogEvent>([
+  // Bot lifecycle
   "BOT_STARTED", "BOT_PAUSED", "BOT_RESUMED", "CONFIG_UPDATED",
+  // Trade outcomes
   "BET_PLACED", "SHADOW_BET_SIMULATED",
   "RESOLUTION_WIN", "RESOLUTION_LOSS",
   "SHADOW_RESOLUTION_WIN", "SHADOW_RESOLUTION_LOSS",
   "SLOT_PROFIT_EXTRACTED",
+  "SLOT_STOP_LOSS",         // stop-loss fired and slot reset
+  // Errors
   "ORDER_FAILED", "RESOLUTION_ERROR", "SCAN_ERROR",
+  // Redeem
+  "REDEEM_CONFIRMED",
+  "REDEEM_FAILED",
+  "REDEEM_UNCAUGHT",
+  "REDEEM_SWEEP_START",
+  "REDEEM_SWEEP_DONE",
 ]);
 
 // ─── file paths ───────────────────────────────────────────────────────────────
@@ -139,18 +163,16 @@ function write(level: LogLevel, event: LogEvent, data: Record<string, unknown>):
 
   const line = JSON.stringify(entry) + "\n";
 
-  // Route to file(s)
   if (TRADE_EVENTS.has(event)) {
     appendToFile(getFilePath("trades"), line);
   } else if (SYSTEM_EVENTS.has(event)) {
     appendToFile(getFilePath("system"), line);
   }
-  // Errors/warnings also go to errors log
+
   if (level === "WARN" || level === "ERROR") {
     appendToFile(getFilePath("errors"), line);
   }
 
-  // Console: only important events (or everything if LOG_VERBOSE=true)
   const verbose = process.env["LOG_VERBOSE"] === "true";
   if (verbose || CONSOLE_EVENTS.has(event) || level === "ERROR") {
     const icon = level === "ERROR" ? "🔴" : level === "WARN" ? "🟡" : "🟢";
@@ -161,18 +183,26 @@ function write(level: LogLevel, event: LogEvent, data: Record<string, unknown>):
 
 function buildSummary(event: LogEvent, data: Record<string, unknown>): string {
   const parts: string[] = [];
-  if (data["asset"])                  parts.push(String(data["asset"]));
-  if (data["duration"])               parts.push(String(data["duration"]));
-  if (data["slotId"] !== undefined)   parts.push(`slot=${data["slotId"]}`);
-  if (data["stakeUsd"] !== undefined) parts.push(`$${data["stakeUsd"]}`);
+  if (data["asset"])                    parts.push(String(data["asset"]));
+  if (data["duration"])                 parts.push(String(data["duration"]));
+  if (data["slotId"] !== undefined)     parts.push(`slot=${data["slotId"]}`);
+  if (data["stakeUsd"] !== undefined)   parts.push(`$${data["stakeUsd"]}`);
   if (data["priceAtBet"] !== undefined) parts.push(`@${data["priceAtBet"]}`);
-  if (data["side"])                   parts.push(`${data["side"]}`);
-  if (data["winSide"])                parts.push(`${data["winSide"]}`);
-  if (data["payoutUsd"] !== undefined) parts.push(`payout=$${data["payoutUsd"]}`);
-  if (data["profitUsd"] !== undefined) parts.push(`profit=$${data["profitUsd"]}`);
+  if (data["side"])                     parts.push(`${data["side"]}`);
+  if (data["winSide"])                  parts.push(`${data["winSide"]}`);
+  if (data["payoutUsd"] !== undefined)  parts.push(`payout=$${data["payoutUsd"]}`);
+  if (data["profitUsd"] !== undefined)  parts.push(`profit=$${data["profitUsd"]}`);
   if (data["profitExtracted"] !== undefined) parts.push(`extracted=$${data["profitExtracted"]}`);
-  if (data["error"])                  parts.push(`ERR: ${data["error"]}`);
-  if (data["updatedKeys"])            parts.push(`keys=${JSON.stringify(data["updatedKeys"])}`);
+  // Stop-loss specific
+  if (data["recoveredUsd"] !== undefined) parts.push(`recovered=$${data["recoveredUsd"]}`);
+  if (data["netLoss"] !== undefined)    parts.push(`netLoss=$${data["netLoss"]}`);
+  // Redeem specific
+  if (data["conditionId"])              parts.push(`condition=${String(data["conditionId"]).slice(0, 10)}…`);
+  if (data["txHash"])                   parts.push(`tx=${String(data["txHash"]).slice(0, 10)}…`);
+  if (data["redeemed"] !== undefined)   parts.push(`redeemed=${data["redeemed"]}`);
+  if (data["failed"] !== undefined && Number(data["failed"]) > 0) parts.push(`failed=${data["failed"]}`);
+  if (data["error"])                    parts.push(`ERR: ${data["error"]}`);
+  if (data["updatedKeys"])              parts.push(`keys=${JSON.stringify(data["updatedKeys"])}`);
   if (data["message"] && parts.length === 0) parts.push(String(data["message"]));
   return parts.length > 0 ? `  ${parts.join("  ")}` : "";
 }
@@ -190,16 +220,11 @@ export const log = {
     write("ERROR", event, data);
   },
 
-  /**
-   * Read the last N lines from a log category.
-   * Checks current hour file, falls back to previous hour.
-   */
   tail(n: number, category: "trades" | "errors" | "system" = "trades"): LogEntry[] {
     const prefix = CONFIG.shadowMode ? `shadow-${category}` : category;
     const dir = getLogDir();
     const lines: string[] = [];
 
-    // Collect entries from current and previous hour files
     for (let offsetHours = 0; offsetHours <= 2; offsetHours++) {
       const d = new Date(Date.now() - offsetHours * 3600_000);
       const suffix = [
@@ -221,7 +246,6 @@ export const log = {
     }).filter(Boolean) as LogEntry[];
   },
 
-  /** List all log files. */
   listFiles(): string[] {
     const dir = getLogDir();
     if (!fs.existsSync(dir)) return [];
