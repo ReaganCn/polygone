@@ -5,34 +5,21 @@
  *
  * BUG 1 — Wrong method for FOK orders
  *   Old: createMarketOrder() + postOrder(order, OrderType.FOK)
- *   The clob-client has a dedicated createAndPostMarketOrder() that handles
- *   FOK/FAK in one call with correct signing. Our two-step approach was calling
- *   postOrder() with a SignedOrder that wasn't built for FOK, which could cause
- *   signature mismatches or rejections.
  *   Fix: use client.createAndPostMarketOrder() for FOK/FAK.
  *
  * BUG 2 — No pre-flight balance check
- *   We never verified the wallet has enough USDC before placing an order.
- *   A low-balance order silently fails and we mark it as success.
- *   Fix: check COLLATERAL balance before every live order, log clearly if
- *   insufficient, return failure early.
+ *   Fix: check COLLATERAL balance before every live order.
  *
  * BUG 3 — roundSizeForPrecision loop tolerance too loose
- *   The check `Math.abs(product - productExact) < 0.005` is the same as
- *   the rounding threshold itself, so it always passes on the first iteration
- *   regardless of precision. The correct check is that the product, when
- *   expressed as a string, has at most 2 decimal places.
  *   Fix: check decimal string length directly.
  *
  * BUG 4 — createAndPostOrder options parameter is not Partial<>
- *   The actual signature is: createAndPostOrder(userOrder, options?, orderType?)
- *   where options is Partial<CreateOrderOptions>. tickSize is REQUIRED inside
- *   CreateOrderOptions (not optional), so passing it as Partial<> means it
- *   could be omitted and the order would use a wrong tick size.
  *   Fix: always pass tickSize explicitly and validate it's a known value.
  *
- * CHANGE (redeemer): conditionId is now mapped from the Gamma API response
- *   into every Market object so that redeemer.ts can call redeemPositions().
+ * CHANGE (stop-loss):
+ *   Added sellPosition() — places a FAK SELL order for an active position.
+ *   Uses FAK (Fill-And-Kill) so partial fills are accepted. Returns the actual
+ *   USDC recovered so slots.ts can compute the real net loss.
  */
 
 import { ClobClient, OrderType, Side, AssetType } from "@polymarket/clob-client";
@@ -40,7 +27,7 @@ import { Wallet } from "ethers";
 import type { ApiKeyCreds } from "@polymarket/clob-client";
 import { CONFIG } from "./config.js";
 import { log } from "./logger.js";
-import type { Market, OrderResult, MarketResolution } from "./types.js";
+import type { Market, ActiveBet, OrderResult, MarketResolution } from "./types.js";
 
 const GAMMA_API = "https://gamma-api.polymarket.com";
 const CLOB_HOST = "https://clob.polymarket.com";
@@ -120,10 +107,6 @@ function getClobClient(): ClobClient {
 
 // ─── balance check ────────────────────────────────────────────────────────────
 
-/**
- * BUG 2 FIX: Check USDC balance before placing a live order.
- * Returns the balance in USDC (6-decimal USDC → divide by 1e6).
- */
 export async function getUsdcBalance(): Promise<number> {
   const client = getClobClient();
   const resp = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
@@ -236,8 +219,6 @@ export async function fetchCryptoMarkets(): Promise<Market[]> {
         if (!detail.enableOrderBook) continue;
         if (!detail.clobTokenIds) continue;
 
-        // conditionId is required for redemption. Skip markets that don't have it
-        // (should never happen for real Polymarket markets, but guard anyway).
         if (!detail.conditionId) {
           log.warn("WARN", { message: `Market ${m.id} has no conditionId — skipping`, slug });
           continue;
@@ -261,7 +242,6 @@ export async function fetchCryptoMarkets(): Promise<Market[]> {
         const winSidePrice = price0 >= price1 ? price0 : price1;
         const tokenIdToBuy = price0 >= price1 ? tokenIds[0] : tokenIds[1];
 
-        // BUG 4 FIX: Validate tick size is a known value, default to "0.01"
         const rawTickSize = detail.orderPriceMinTickSize?.toString() ?? "0.01";
         const tickSize: TickSize = VALID_TICK_SIZES.includes(rawTickSize as TickSize)
           ? (rawTickSize as TickSize)
@@ -270,7 +250,7 @@ export async function fetchCryptoMarkets(): Promise<Market[]> {
         seen.add(m.id);
         results.push({
           id: m.id,
-          conditionId: detail.conditionId,  // ← mapped from Gamma API response
+          conditionId: detail.conditionId,
           question: detail.question ?? event.title ?? slug,
           asset, duration,
           closesAt: endDateStr,
@@ -360,7 +340,7 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
   const price = market.winSidePrice;
   const tickSize = market.tickSize as TickSize;
 
-  // BUG 2 FIX: Pre-flight balance check
+  // Pre-flight balance check
   try {
     const balance = await getUsdcBalance();
     if (balance < stakeUsd) {
@@ -380,7 +360,6 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
     let resp: unknown;
 
     if (orderType === OrderType.FOK || orderType === OrderType.FAK) {
-      // BUG 1 FIX: Use createAndPostMarketOrder() for FOK/FAK
       resp = await client.createAndPostMarketOrder(
         {
           tokenID: market.tokenIdToBuy,
@@ -392,10 +371,7 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
         orderType
       );
     } else {
-      // GTC/GTD: limit order
-      // BUG 3 FIX: Use correctly validated size
       const sizeShares = roundSizeForPrecision(stakeUsd / price, price);
-
       resp = await client.createAndPostOrder(
         {
           tokenID: market.tokenIdToBuy,
@@ -409,7 +385,6 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
     }
 
     const r = resp as Record<string, unknown>;
-
     const errorMsg = r["errorMsg"] ?? r["error"];
     const status = r["status"] as string | undefined;
     const isRejected =
@@ -420,11 +395,9 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
     if (isRejected) {
       const errorText = String(errorMsg ?? status ?? "Order rejected by CLOB");
       log.error("ORDER_FAILED", {
-        marketId: market.id,
-        tokenId: market.tokenIdToBuy,
+        marketId: market.id, tokenId: market.tokenIdToBuy,
         stakeUsd, price, orderType: CONFIG.orderType,
-        error: errorText,
-        rawResponse: resp,
+        error: errorText, rawResponse: resp,
       });
       return { success: false, error: errorText };
     }
@@ -432,13 +405,9 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
     const orderId = (r["orderId"] ?? r["id"] ?? r["orderID"] ?? "") as string;
 
     log.info("ORDER_RESPONSE", {
-      marketId: market.id,
-      tokenId: market.tokenIdToBuy,
-      side: market.winSide,
-      stakeUsd, price,
-      orderType: CONFIG.orderType,
-      orderId, status,
-      rawResponse: resp,
+      marketId: market.id, tokenId: market.tokenIdToBuy,
+      side: market.winSide, stakeUsd, price,
+      orderType: CONFIG.orderType, orderId, status, rawResponse: resp,
     });
 
     return {
@@ -455,10 +424,134 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
   }
 }
 
+// ─── stop-loss sell ───────────────────────────────────────────────────────────
+
+/**
+ * Sell an active position to cap losses.
+ *
+ * Uses FAK (Fill-And-Kill) regardless of the bot's orderType setting:
+ *   - FAK accepts partial fills, which is critical because near-expiry losing
+ *     positions have very thin bid liquidity. A partial fill recovers something
+ *     rather than nothing.
+ *   - FOK would reject the whole order if full size can't fill, leaving you
+ *     holding a position worth near-zero at expiry.
+ *
+ * The sell price floor is CONFIG.stopLossLimitPrice. Setting this too high means
+ * no bids exist at that price and the order won't fill at all.
+ *
+ * Returns the estimated USDC recovered (filledShares × stopLossLimitPrice).
+ * The caller (trader.ts) passes this to recordStopLoss() for accurate accounting.
+ */
+export async function sellPosition(bet: ActiveBet): Promise<OrderResult> {
+  const client = getClobClient();
+
+  // The token we hold is the one we bought
+  const tokenIdToSell = bet.market.tokenIdToBuy;
+  const tickSize = bet.market.tickSize as TickSize;
+
+  // Shares owned = stake / price at which we bought
+  const sharesOwned = roundSizeForPrecision(bet.stakeUsd / bet.priceAtBet, bet.priceAtBet);
+  const sellPrice = CONFIG.stopLossLimitPrice;
+
+  log.info("ORDER_RESPONSE", {
+    action: "stop_loss_sell_attempt",
+    betId: bet.betId,
+    marketId: bet.market.id,
+    tokenId: tokenIdToSell,
+    sharesOwned,
+    sellPrice,
+    stakeUsd: bet.stakeUsd,
+    priceAtBet: bet.priceAtBet,
+  });
+
+  try {
+    // Always FAK for stop-loss: partial fill > no fill
+    const resp = await client.createAndPostMarketOrder(
+      {
+        tokenID: tokenIdToSell,
+        amount: sharesOwned,  // for SELL, amount = shares (not dollars)
+        side: Side.SELL,
+        price: sellPrice,     // minimum price floor
+      },
+      { tickSize, negRisk: bet.market.negRisk },
+      OrderType.FAK
+    );
+
+    const r = resp as Record<string, unknown>;
+    const errorMsg = r["errorMsg"] ?? r["error"];
+    const status = r["status"] as string | undefined;
+    const isRejected =
+      (typeof errorMsg === "string" && errorMsg.length > 0) ||
+      status === "rejected" ||
+      status === "error";
+
+    if (isRejected) {
+      const errorText = String(errorMsg ?? status ?? "Sell order rejected");
+      log.error("ORDER_FAILED", {
+        action: "stop_loss_sell",
+        betId: bet.betId, marketId: bet.market.id,
+        sharesOwned, sellPrice, error: errorText, rawResponse: resp,
+      });
+      return { success: false, error: errorText };
+    }
+
+    // Attempt to read filled quantity from the response.
+    // The CLOB may return matchedAmount, filledAmount, or similar fields.
+    const filledShares = parseFilledShares(r, sharesOwned);
+    const recoveredUsd = round4(filledShares * sellPrice);
+
+    log.info("ORDER_RESPONSE", {
+      action: "stop_loss_sell_filled",
+      betId: bet.betId, marketId: bet.market.id,
+      sharesOwned, filledShares, sellPrice,
+      recoveredUsd, stakeUsd: bet.stakeUsd,
+      netLoss: round4(bet.stakeUsd - recoveredUsd),
+      rawResponse: resp,
+    });
+
+    return {
+      success: true,
+      avgPrice: sellPrice,
+      filledShares,
+      filled: filledShares > 0,
+      rawResponse: resp,
+    };
+  } catch (err) {
+    const error = (err as Error).message;
+    log.error("ORDER_FAILED", {
+      action: "stop_loss_sell",
+      betId: bet.betId, marketId: bet.market.id,
+      sharesOwned, sellPrice, error,
+    });
+    return { success: false, error };
+  }
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 /**
- * BUG 3 FIX: Round share size so that size × price has at most 2 decimal places.
+ * Extract filled share count from the raw CLOB response.
+ * The field name varies across CLOB API versions. Fall back to full size
+ * if the field is absent (assumes fully filled, which is the optimistic case).
+ */
+function parseFilledShares(r: Record<string, unknown>, fallback: number): number {
+  const candidates = [
+    r["matchedAmount"],
+    r["filledAmount"],
+    r["filled_amount"],
+    r["takerAmount"],
+  ];
+  for (const v of candidates) {
+    if (v !== undefined && v !== null) {
+      const n = parseFloat(String(v));
+      if (!isNaN(n) && n >= 0) return n;
+    }
+  }
+  return fallback;
+}
+
+/**
+ * Round share size so that size × price has at most 2 decimal places.
  */
 function roundSizeForPrecision(rawSize: number, price: number): number {
   let size = Math.floor(rawSize * 10000) / 10000;
