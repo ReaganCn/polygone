@@ -1,22 +1,37 @@
 /**
  * trader.ts — Main orchestrator.
- * Now receives BetRule from scanner and threads it through to slot accounting.
  *
- * CHANGE (redeemer integration):
+ * CHANGE (stop-loss):
+ *   handleStopLoss(marketId) is exported for scanner.ts to call when a live
+ *   price tick drops below CONFIG.stopLossTriggerPrice on an active bet.
+ *   It places a FAK SELL via polymarket.sellPosition(), then records the
+ *   recovered amount via slots.recordStopLoss() so P&L is accurate.
+ *
+ * CHANGE (redeemer):
  *   After every live RESOLUTION_WIN, redeemAfterWin() is called so the winning
  *   tokens are immediately converted back to spendable USDC.
  */
 
 import { CONFIG } from "./config.js";
 import { log } from "./logger.js";
-import { placeOrder, fetchMarketResolution } from "./polymarket.js";
-import { getIdleSlot, assignBet, recordWin, recordLoss } from "./slots.js";
+import { placeOrder, fetchMarketResolution, sellPosition } from "./polymarket.js";
+import { getIdleSlot, assignBet, recordWin, recordLoss, recordStopLoss } from "./slots.js";
 import { trackMarket, untrackMarket } from "./scanner.js";
 import { simulateBet } from "./shadow.js";
-import { redeemAfterWin } from "./redeemer.js"; // ← NEW
+import { redeemAfterWin } from "./redeemer.js";
 import type { Market, ActiveBet, BetRule } from "./types.js";
 
 const activeBetsByMarketId = new Map<string, ActiveBet>();
+
+/**
+ * Returns the token ID that was actually bought for a tracked bet.
+ * Used by scanner.ts to compare the stop-loss price against the correct token
+ * (the one the bet is on) rather than the market's current winSidePrice, which
+ * may have flipped sides since the bet was placed.
+ */
+export function getBetTokenId(marketId: string): string | undefined {
+  return activeBetsByMarketId.get(marketId)?.market.tokenIdToBuy;
+}
 
 function generateBetId(): string {
   return `bet-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
@@ -60,6 +75,117 @@ export async function handleQualifyingMarket(market: Market, rule: BetRule): Pro
   }
 }
 
+// ─── stop-loss ────────────────────────────────────────────────────────────────
+
+/**
+ * Called by scanner.ts when a live price update shows the win-side price of
+ * an active bet has dropped below CONFIG.stopLossTriggerPrice.
+ *
+ * Flow:
+ *   1. Mark the bet as stopLossTriggered immediately to prevent duplicate calls
+ *      on the next price tick while the sell is in-flight.
+ *   2. Place a FAK SELL for the full share position.
+ *   3a. Sell succeeded (fully or partially):
+ *       Record the recovered USDC via recordStopLoss() so the net loss is
+ *       tracked correctly, then untrack the market and free the slot.
+ *   3b. Sell failed entirely (order rejected, network error, zero liquidity):
+ *       The position is STILL OPEN on-chain. We keep the bet in
+ *       activeBetsByMarketId so the existing fallback resolution watcher and
+ *       WebSocket market_resolved handler can still settle it correctly.
+ *       stopLossTriggered stays true so no further sell attempts are made.
+ *       The final outcome (win or loss at resolution) is recorded normally.
+ *
+ * Shadow mode: simulates the stop-loss without placing a real order. Assumes
+ * full recovery at stopLossLimitPrice for accounting purposes.
+ */
+export async function handleStopLoss(marketId: string): Promise<void> {
+  const bet = activeBetsByMarketId.get(marketId);
+  if (!bet) return;
+
+  // Guard: only trigger once per bet even if multiple price ticks fire
+  if (bet.stopLossTriggered) return;
+  bet.stopLossTriggered = true;
+
+  const sharesOwned = bet.stakeUsd / bet.priceAtBet;
+
+  if (bet.shadow) {
+    // Shadow mode: simulate the sell at stopLossLimitPrice — always "succeeds"
+    activeBetsByMarketId.delete(marketId);
+    const simulatedRecovered = round2(sharesOwned * CONFIG.stopLossLimitPrice);
+    log.info("SHADOW_RESOLUTION_LOSS", {
+      source: "stop_loss_shadow",
+      betId: bet.betId, slotId: bet.slotId,
+      marketId, question: bet.market.question,
+      betSide: bet.side,
+      stakeUsd: bet.stakeUsd,
+      simulatedRecoveredUsd: simulatedRecovered,
+      netLoss: round2(bet.stakeUsd - simulatedRecovered),
+      triggerPrice: CONFIG.stopLossTriggerPrice,
+      limitPrice: CONFIG.stopLossLimitPrice,
+    });
+    recordStopLoss(bet.slotId, simulatedRecovered);
+    untrackMarket(marketId);
+    return;
+  }
+
+  // Live mode: place the actual sell order
+  log.info("ORDER_RESPONSE", {
+    action: "stop_loss_triggered",
+    betId: bet.betId, slotId: bet.slotId,
+    marketId, question: bet.market.question,
+    betSide: bet.side,
+    stakeUsd: bet.stakeUsd,
+    priceAtBet: bet.priceAtBet,
+    sharesOwned: round4(sharesOwned),
+    triggerPrice: CONFIG.stopLossTriggerPrice,
+    limitPrice: CONFIG.stopLossLimitPrice,
+    rule: bet.rule,
+  });
+
+  const result = await sellPosition(bet);
+
+  if (!result.success) {
+    // ── Sell failed completely ────────────────────────────────────────────────
+    // The position is still open on-chain. Do NOT delete from activeBetsByMarketId
+    // so the fallback resolution watcher and WebSocket market_resolved handler
+    // can still settle this bet when the market closes.
+    // stopLossTriggered remains true so no further sell attempts are made.
+    log.error("ORDER_FAILED", {
+      action: "stop_loss_sell_failed_position_held",
+      betId: bet.betId, slotId: bet.slotId, marketId,
+      question: bet.market.question,
+      betSide: bet.side, rule: bet.rule,
+      stakeUsd: bet.stakeUsd,
+      note: "Position is still open. Will resolve normally at market close.",
+      sellError: result.error,
+    });
+    return;
+  }
+
+  // ── Sell succeeded (fully or partially) ──────────────────────────────────
+  // Remove the bet now that the position is closed.
+  activeBetsByMarketId.delete(marketId);
+
+  const recoveredUsd = result.filledShares !== undefined
+    ? round2(result.filledShares * CONFIG.stopLossLimitPrice)
+    : round2(sharesOwned * CONFIG.stopLossLimitPrice); // fallback: assume full fill
+
+  log.info("RESOLUTION_LOSS", {
+    source: "stop_loss",
+    betId: bet.betId, slotId: bet.slotId, marketId,
+    question: bet.market.question,
+    betSide: bet.side, rule: bet.rule,
+    stakeUsd: bet.stakeUsd,
+    recoveredUsd,
+    netLoss: round2(bet.stakeUsd - recoveredUsd),
+    filledShares: result.filledShares,
+    sellSuccess: true,
+  });
+
+  recordStopLoss(bet.slotId, recoveredUsd);
+  untrackMarket(marketId);
+}
+
 // ─── WebSocket resolution ─────────────────────────────────────────────────────
 
 export function handleWsResolution(
@@ -69,6 +195,11 @@ export function handleWsResolution(
 ): void {
   const bet = activeBetsByMarketId.get(marketId);
   if (!bet) return;
+
+  // If stop-loss triggered AND succeeded, the bet was already removed from
+  // activeBetsByMarketId (so this function wouldn't have been entered).
+  // If we reach here with stopLossTriggered=true it means the sell failed
+  // completely and the position is still open — fall through and resolve normally.
 
   activeBetsByMarketId.delete(marketId);
 
@@ -90,20 +221,15 @@ export function handleWsResolution(
 
     recordWin(bet.slotId, payoutUsd);
 
-    // ── NEW: trigger redemption so USDC becomes spendable immediately ─────────
-    // Fire-and-forget — we don't await because the slot can already start
-    // tracking the next bet. Redemption confirmation is logged by redeemer.ts.
+    // Fire-and-forget redemption — slot is free immediately, redeemer
+    // handles the 60s oracle delay and retries in the background.
     if (!bet.shadow) {
       redeemAfterWin(bet.market.conditionId, bet.market.question).catch(
-        (err) =>
-          log.error("REDEEM_UNCAUGHT", {
-            marketId,
-            error: (err as Error).message,
-          })
+        (err) => log.error("REDEEM_UNCAUGHT", {
+          marketId, error: (err as Error).message,
+        })
       );
     }
-    // ─────────────────────────────────────────────────────────────────────────
-
   } else {
     log.info(bet.shadow ? "SHADOW_RESOLUTION_LOSS" : "RESOLUTION_LOSS", {
       source: "websocket",
@@ -202,7 +328,7 @@ function startFallbackResolutionWatcher(bet: ActiveBet): void {
           recordLoss(bet.slotId);
           untrackMarket(bet.market.id);
         } else {
-          // handleWsResolution already calls redeemAfterWin internally
+          // Routes through handleWsResolution which checks stopLossTriggered
           handleWsResolution(bet.market.id, "", resolution.outcome);
         }
       } catch (err) {
@@ -228,3 +354,6 @@ function normaliseOutcome(outcome: string, tokenId: string, bet: ActiveBet): "YE
   log.warn("WARN", { message: "Unrecognised outcome — defaulting NO", outcome, tokenId });
   return "NO";
 }
+
+function round2(n: number): number { return Math.round(n * 100) / 100; }
+function round4(n: number): number { return Math.round(n * 10000) / 10000; }
