@@ -1,14 +1,12 @@
 /**
  * config.ts — Single source of truth for all bot configuration.
  *
- * New in this version:
- *   - Per-duration price ranges: PRICE_RANGE_MIN_5M, PRICE_RANGE_MAX_5M,
- *     PRICE_RANGE_MIN_15M, PRICE_RANGE_MAX_15M
- *   - Per-duration max time remaining: MAX_TIME_REMAINING_5M (default 150s),
- *     MAX_TIME_REMAINING_15M (default 450s) — half of each market duration.
- *     A bet is only placed when timeRemaining <= this value.
- *   - Toggle each market type on/off: ENABLE_5M, ENABLE_15M, ENABLE_FALLBACK
- *   - Fallback is now a named rule (not just a time-based filter)
+ * CHANGE (stop-loss):
+ *   Three new mutable fields added:
+ *     stopLossEnabled       — master on/off toggle
+ *     stopLossTriggerPrice  — win-side price below which the stop fires (default 0.49)
+ *     stopLossLimitPrice    — worst sell price accepted; prevents selling into zero
+ *                             liquidity (default 0.05)
  *
  * CHANGE (redeemer):
  *   Added builder program credentials: polyBuilderApiKey, polyBuilderSecret,
@@ -67,14 +65,13 @@ export interface BotConfig {
   polySecret: string;
   polyPassphrase: string;
 
-  // ── Builder program credentials (required for auto-redemption) ─────────────
+  // Builder program credentials (required for auto-redemption)
   // Generate at: polymarket.com/settings?tab=builder
   polyBuilderApiKey: string;
   polyBuilderSecret: string;
   polyBuilderPassphrase: string;
   // RPC endpoint for Polygon — any public or private node works
   polygonRpcUrl: string;
-  // ──────────────────────────────────────────────────────────────────────────
 
   // Scanning
   scanIntervalMs: number;
@@ -100,6 +97,19 @@ export interface BotConfig {
   fallbackTimeRemaining15m: number;
   fallbackMinPrice: number;
   fallbackMaxPrice: number;
+
+  // ── Stop-loss ──────────────────────────────────────────────────────────────
+  // When the live win-side price of an active bet drops below stopLossTriggerPrice,
+  // the bot attempts to sell the position at or above stopLossLimitPrice to cap
+  // the loss. Uses FAK so partial fills are accepted over a full rejection.
+  //
+  // Practical note: near-expiry losing-side markets have thin bid liquidity.
+  // Setting stopLossLimitPrice too high means the order won't fill at all.
+  // A floor of 0.05 sweeps most remaining bids while preventing a zero-fill.
+  stopLossEnabled: boolean;
+  stopLossTriggerPrice: number; // fire when win-side price drops below this (default 0.49)
+  stopLossLimitPrice: number;   // worst acceptable sell price per share   (default 0.05)
+  // ──────────────────────────────────────────────────────────────────────────
 
   // Order execution
   orderType: OrderTypeOption;
@@ -137,8 +147,7 @@ function loadConfig(): BotConfig {
     polySecret: optionalEnv("POLY_SECRET", ""),
     polyPassphrase: optionalEnv("POLY_PASSPHRASE", ""),
 
-    // Builder credentials — optionalEnv so the bot still boots in shadow mode
-    // without them. redeemer.ts will throw clearly at runtime if live mode needs them.
+    // Builder credentials — optional so shadow mode boots without them
     polyBuilderApiKey:     optionalEnv("POLY_BUILDER_API_KEY", ""),
     polyBuilderSecret:     optionalEnv("POLY_BUILDER_SECRET", ""),
     polyBuilderPassphrase: optionalEnv("POLY_BUILDER_PASSPHRASE", ""),
@@ -164,10 +173,15 @@ function loadConfig(): BotConfig {
     fallbackMinPrice:         parseFloat_("FALLBACK_MIN_PRICE", 0.0),
     fallbackMaxPrice:         parseFloat_("FALLBACK_MAX_PRICE", 0.99),
 
+    // Stop loss Config
+    stopLossEnabled:      parseBool("STOP_LOSS_ENABLED", false),
+    stopLossTriggerPrice: parseFloat_("STOP_LOSS_TRIGGER_PRICE", 0.40),
+    stopLossLimitPrice:   parseFloat_("STOP_LOSS_LIMIT_PRICE",   0.05),
+
     orderType: orderTypeRaw as OrderTypeOption,
 
-    numSlots:            parseInt_("NUM_SLOTS", 5),
-    slotInitialUsd:      parseFloat_("SLOT_INITIAL_USD", 1),
+    numSlots:             parseInt_("NUM_SLOTS", 5),
+    slotInitialUsd:       parseFloat_("SLOT_INITIAL_USD", 1),
     slotProfitMultiplier: parseFloat_("SLOT_PROFIT_MULTIPLIER", 1.2),
 
     shadowMode: parseBool("SHADOW_MODE", true),
@@ -195,6 +209,9 @@ export type MutableConfigKeys =
   | "fallbackTimeRemaining15m"
   | "fallbackMinPrice"
   | "fallbackMaxPrice"
+  | "stopLossEnabled"
+  | "stopLossTriggerPrice"
+  | "stopLossLimitPrice"
   | "orderType"
   | "numSlots"
   | "slotInitialUsd"
@@ -203,26 +220,29 @@ export type MutableConfigKeys =
   | "targetAssets";
 
 const KEY_TYPES: Record<MutableConfigKeys, "number" | "integer" | "boolean" | "string" | "stringArray" | "orderType"> = {
-  scanIntervalMs:         "integer",
-  enable5m:               "boolean",
-  enable15m:              "boolean",
-  enableFallback:         "boolean",
-  priceRangeMin5m:        "number",
-  priceRangeMax5m:        "number",
-  priceRangeMin15m:       "number",
-  priceRangeMax15m:       "number",
-  maxTimeRemaining5m:     "integer",
-  maxTimeRemaining15m:    "integer",
+  scanIntervalMs:           "integer",
+  enable5m:                 "boolean",
+  enable15m:                "boolean",
+  enableFallback:           "boolean",
+  priceRangeMin5m:          "number",
+  priceRangeMax5m:          "number",
+  priceRangeMin15m:         "number",
+  priceRangeMax15m:         "number",
+  maxTimeRemaining5m:       "integer",
+  maxTimeRemaining15m:      "integer",
   fallbackTimeRemaining5m:  "integer",
   fallbackTimeRemaining15m: "integer",
   fallbackMinPrice:         "number",
   fallbackMaxPrice:         "number",
-  orderType:              "orderType",
-  numSlots:               "integer",
-  slotInitialUsd:         "number",
-  slotProfitMultiplier:   "number",
-  shadowMode:             "boolean",
-  targetAssets:           "stringArray",
+  stopLossEnabled:          "boolean",
+  stopLossTriggerPrice:     "number",
+  stopLossLimitPrice:       "number",
+  orderType:                "orderType",
+  numSlots:                 "integer",
+  slotInitialUsd:           "number",
+  slotProfitMultiplier:     "number",
+  shadowMode:               "boolean",
+  targetAssets:             "stringArray",
 };
 
 export const CONFIG: BotConfig = loadConfig();
