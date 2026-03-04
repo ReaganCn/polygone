@@ -6,7 +6,7 @@ export type BetRule = "5m" | "15m" | "fallback";
 
 export interface Market {
   id: string;
-  conditionId: string; 
+  conditionId: string;   // CTF condition ID — required by redeemer.ts to call redeemPositions()
   question: string;
   asset: string;
   /** Canonical duration key: "5m" | "15m" */
@@ -35,6 +35,12 @@ export interface ActiveBet {
   priceAtBet: number;
   /** Which qualifying rule triggered this bet */
   rule: BetRule;
+  /**
+   * Set to true once a stop-loss sell has been initiated for this bet.
+   * Prevents the scanner from firing the stop-loss a second time on the
+   * next price tick while the first sell order is still in-flight.
+   */
+  stopLossTriggered?: boolean;
 }
 
 export interface OrderResult {
@@ -42,14 +48,14 @@ export interface OrderResult {
   orderId?: string;
   avgPrice?: number;
   filled?: boolean;
-  rawResponse?: unknown;
+  /** Shares actually filled (used by stop-loss to compute recovered USDC) */
+  filledShares?: number;
   error?: string;
+  rawResponse?: unknown;
 }
-
-export type ResolutionOutcome = "YES" | "NO" | "PENDING" | "CANCELLED";
 
 export interface MarketResolution {
   marketId: string;
-  outcome: ResolutionOutcome;
+  outcome: "YES" | "NO" | "CANCELLED" | "PENDING";
   resolvedAt?: string;
 }
