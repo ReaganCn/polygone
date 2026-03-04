@@ -20,6 +20,12 @@
  *
  * Rules are checked in order: 5m → 15m → fallback.
  * A market only fires one callback per evaluation (first matching rule wins).
+ *
+ * CHANGE (stop-loss):
+ *   Every live price update for a TRACKED market (one with an active bet) is
+ *   checked against CONFIG.stopLossTriggerPrice. If the win-side price drops
+ *   below that threshold and stopLossEnabled is true, handleStopLoss() is called
+ *   in trader.ts. The bet's stopLossTriggered flag prevents duplicate calls.
  */
 
 import { CONFIG } from "./config.js";
@@ -36,6 +42,7 @@ import {
   type ResolvedMarketEvent,
   type NewMarketEvent,
 } from "./websocket.js";
+import { handleStopLoss, getBetTokenId } from "./trader.js";
 import type { Market, BetRule } from "./types.js";
 
 type MarketCallback = (market: Market, rule: BetRule) => void;
@@ -74,6 +81,11 @@ export async function startScanner(
     message: "Scanner started.",
     knownMarketCount: knownMarkets.size,
     heartbeatIntervalMs: CONFIG.scanIntervalMs,
+    stopLoss: {
+      enabled: CONFIG.stopLossEnabled,
+      triggerPrice: CONFIG.stopLossTriggerPrice,
+      limitPrice: CONFIG.stopLossLimitPrice,
+    },
     rules: {
       "5m":      { enabled: CONFIG.enable5m,       maxTimeRemaining: CONFIG.maxTimeRemaining5m,  priceRange: [CONFIG.priceRangeMin5m,  CONFIG.priceRangeMax5m]  },
       "15m":     { enabled: CONFIG.enable15m,      maxTimeRemaining: CONFIG.maxTimeRemaining15m, priceRange: [CONFIG.priceRangeMin15m, CONFIG.priceRangeMax15m] },
@@ -145,14 +157,17 @@ async function refreshKnownMarkets(): Promise<void> {
     }
   }
 
-  // Prune expired
+  // Prune expired markets.
+  // IMPORTANT: do NOT prune a market that is currently tracked (has an active bet
+  // whose stop-loss sell failed). That market's tokenToMarket entry must stay alive
+  // so the WebSocket market_resolved event can still route to handleWsResolution.
   for (const [id, market] of knownMarkets) {
     if (new Date(market.closesAt).getTime() < now - 30_000) {
+      if (trackedMarketIds.has(id)) continue; // active bet still pending resolution
       knownMarkets.delete(id);
       tokenToMarket.delete(market.yesTokenId);
       tokenToMarket.delete(market.noTokenId);
       unsubscribeTokenIds([market.yesTokenId, market.noTokenId]);
-      trackedMarketIds.delete(id);
     }
   }
 
@@ -238,16 +253,14 @@ async function handleWsNewMarket(event: NewMarketEvent): Promise<void> {
 // ─── qualifying logic ─────────────────────────────────────────────────────────
 
 /**
- * Evaluate a market against all enabled rules.
+ * Check a market against all enabled entry rules.
  * Returns the first matching rule, or null if none qualify.
- *
- * Rule priority: 5m → 15m → fallback
+ * Rule priority: 5m → 15m → fallback.
  */
 function getMatchingRule(market: Market, price: number): BetRule | null {
   const t = market.timeRemainingSeconds;
   if (t <= 0) return null;
 
-  // 5m rule
   if (market.duration === "5m" && CONFIG.enable5m) {
     if (
       t <= CONFIG.maxTimeRemaining5m &&
@@ -256,7 +269,6 @@ function getMatchingRule(market: Market, price: number): BetRule | null {
     ) return "5m";
   }
 
-  // 15m rule
   if (market.duration === "15m" && CONFIG.enable15m) {
     if (
       t <= CONFIG.maxTimeRemaining15m &&
@@ -265,7 +277,6 @@ function getMatchingRule(market: Market, price: number): BetRule | null {
     ) return "15m";
   }
 
-  // fallback rule — per-duration time threshold
   if (CONFIG.enableFallback) {
     const fallbackThreshold = market.duration === "15m"
       ? CONFIG.fallbackTimeRemaining15m
@@ -279,8 +290,37 @@ function getMatchingRule(market: Market, price: number): BetRule | null {
 }
 
 function evaluateAndFire(market: Market, price: number, source: string): void {
+  const isTracked = trackedMarketIds.has(market.id);
+
+  // ── Stop-loss check ────────────────────────────────────────────────────────
+  // Runs even when the scanner is paused — pausing blocks new entries only,
+  // not management of positions already open.
+  // The bet's stopLossTriggered flag (set in trader.ts) prevents double-firing.
+  //
+  // We compare against the live price of the TOKEN THE BET BOUGHT, not the
+  // market's current winSidePrice. After a bet is placed the market can flip
+  // (other side becomes dominant), causing winSidePrice to reflect the other
+  // token. getBetTokenId() returns the tokenIdToBuy frozen at bet placement time.
+  if (isTracked && CONFIG.stopLossEnabled) {
+    const betTokenId = getBetTokenId(market.id);
+    const betTokenPrice = betTokenId ? (getTokenPrice(betTokenId)?.bestAsk ?? price) : price;
+    if (betTokenPrice < CONFIG.stopLossTriggerPrice) {
+    // Fire-and-forget — handleStopLoss is async but we don't block the price loop
+      handleStopLoss(market.id).catch((err) =>
+        log.error("ERROR", {
+          message: "Uncaught error in handleStopLoss",
+          marketId: market.id,
+          error: (err as Error).message,
+        })
+      );
+      return; // Don't attempt to enter a new bet on the same tick
+    }
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // New entries are blocked when paused or when slot is already active
   if (isPaused) return;
-  if (trackedMarketIds.has(market.id)) return;
+  if (isTracked) return;
 
   const rule = getMatchingRule(market, price);
   if (!rule) return;
