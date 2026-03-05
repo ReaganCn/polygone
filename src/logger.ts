@@ -43,6 +43,18 @@ export type LogEvent =
   | "REDEEM_SWEEP_NONE"
   | "REDEEM_SWEEP_START"
   | "REDEEM_SWEEP_DONE"
+  | "REDEEM_SAFE_DERIVED"
+  | "REDEEM_SAFE_DERIVE_WARN"
+  | "REDEEM_SAFE_FALLBACK_EOA"
+  | "REDEEM_SWEEP_SAFE_ERROR"
+  | "REDEEM_SWEEP_SKIP_UNRESOLVED"
+  | "REDEEM_RELAY_FAILED"
+  | "REDEEM_WAITING_RESOLUTION"
+  | "REDEEM_RESOLUTION_CONFIRMED"
+  | "REDEEM_RESOLUTION_POLLING"
+  | "REDEEM_RESOLUTION_TIMEOUT"
+  | "REDEEM_RESOLUTION_POLL_ERROR"
+  | "REDEEM_RESOLUTION_GAMMA_TRUE_ONCHAIN_PENDING"
   // Shadow mode → trades log
   | "SHADOW_BET_SIMULATED"
   | "SHADOW_RESOLUTION_WIN"
@@ -67,7 +79,13 @@ export type LogEvent =
   // General
   | "INFO"
   | "WARN"
-  | "ERROR";
+  | "ERROR"
+  | "SLOT_RESERVED"
+  | "SLOT_RELEASED"
+  | "RESOLUTION_CANCELLED_READING"
+  | "SHADOW_BET_FAILED"
+  | "STOP_LOSS_PARTIAL_FILL"
+  | "BET_SKIPPED_DUPLICATE";
 
 interface LogEntry {
   ts: string;
@@ -84,16 +102,22 @@ const TRADE_EVENTS = new Set<LogEvent>([
   "RESOLUTION_WIN", "RESOLUTION_LOSS", "RESOLUTION_ERROR",
   "SHADOW_BET_SIMULATED", "SHADOW_RESOLUTION_WIN", "SHADOW_RESOLUTION_LOSS",
   "SLOT_ASSIGNED", "SLOT_WIN_COMPOUND", "SLOT_LOSS_RESET", "SLOT_STOP_LOSS",
-  "SLOT_PROFIT_EXTRACTED", "SLOT_STATE_SNAPSHOT",
+  "SLOT_PROFIT_EXTRACTED", "SLOT_STATE_SNAPSHOT", "SLOT_RESERVED", "SLOT_RELEASED",
+  "SHADOW_BET_FAILED", "STOP_LOSS_PARTIAL_FILL", "BET_SKIPPED_DUPLICATE",
   "REDEEM_UNCAUGHT", "REDEEM_SUBMITTING", "REDEEM_CONFIRMED", "REDEEM_FAILED",
   "REDEEM_SKIPPED_SHADOW", "REDEEM_SWEEP_FETCH_ERROR", "REDEEM_SWEEP_ERROR",
   "REDEEM_SWEEP_NONE", "REDEEM_SWEEP_START", "REDEEM_SWEEP_DONE",
+  "REDEEM_RELAY_FAILED", "REDEEM_WAITING_RESOLUTION", "REDEEM_RESOLUTION_CONFIRMED",
+  "REDEEM_RESOLUTION_TIMEOUT", "REDEEM_RESOLUTION_GAMMA_TRUE_ONCHAIN_PENDING",
+  "REDEEM_SWEEP_SKIP_UNRESOLVED", "REDEEM_SWEEP_SAFE_ERROR",
 ]);
 
 const SYSTEM_EVENTS = new Set<LogEvent>([
   "SCAN_TICK", "MARKET_FOUND", "SCAN_ERROR",
   "BOT_STARTED", "BOT_PAUSED", "BOT_RESUMED", "CONFIG_UPDATED",
-  "RESOLUTION_POLLING", "INFO",
+  "RESOLUTION_POLLING", "RESOLUTION_CANCELLED_READING", "INFO",
+  "REDEEM_SAFE_DERIVED", "REDEEM_SAFE_DERIVE_WARN", "REDEEM_SAFE_FALLBACK_EOA",
+  "REDEEM_RESOLUTION_POLLING", "REDEEM_RESOLUTION_POLL_ERROR",
 ]);
 
 // Events always shown on console regardless of LOG_VERBOSE
@@ -105,7 +129,7 @@ const CONSOLE_EVENTS = new Set<LogEvent>([
   "RESOLUTION_WIN", "RESOLUTION_LOSS",
   "SHADOW_RESOLUTION_WIN", "SHADOW_RESOLUTION_LOSS",
   "SLOT_PROFIT_EXTRACTED",
-  "SLOT_STOP_LOSS",         // stop-loss fired and slot reset
+  "SLOT_STOP_LOSS",
   // Errors
   "ORDER_FAILED", "RESOLUTION_ERROR", "SCAN_ERROR",
   // Redeem
@@ -114,6 +138,10 @@ const CONSOLE_EVENTS = new Set<LogEvent>([
   "REDEEM_UNCAUGHT",
   "REDEEM_SWEEP_START",
   "REDEEM_SWEEP_DONE",
+  "REDEEM_RESOLUTION_CONFIRMED",
+  "REDEEM_RESOLUTION_TIMEOUT",
+  "REDEEM_SWEEP_SAFE_ERROR",
+  "REDEEM_SAFE_FALLBACK_EOA",
 ]);
 
 // ─── file paths ───────────────────────────────────────────────────────────────
@@ -198,9 +226,11 @@ function buildSummary(event: LogEvent, data: Record<string, unknown>): string {
   if (data["netLoss"] !== undefined)    parts.push(`netLoss=$${data["netLoss"]}`);
   // Redeem specific
   if (data["conditionId"])              parts.push(`condition=${String(data["conditionId"]).slice(0, 10)}…`);
+  if (data["safeAddress"])              parts.push(`safe=${String(data["safeAddress"]).slice(0, 10)}…`);
   if (data["txHash"])                   parts.push(`tx=${String(data["txHash"]).slice(0, 10)}…`);
   if (data["redeemed"] !== undefined)   parts.push(`redeemed=${data["redeemed"]}`);
   if (data["failed"] !== undefined && Number(data["failed"]) > 0) parts.push(`failed=${data["failed"]}`);
+  if (data["attempt"] !== undefined)    parts.push(`attempt=${data["attempt"]}/${data["maxAttempts"] ?? "?"}`);
   if (data["error"])                    parts.push(`ERR: ${data["error"]}`);
   if (data["updatedKeys"])              parts.push(`keys=${JSON.stringify(data["updatedKeys"])}`);
   if (data["message"] && parts.length === 0) parts.push(String(data["message"]));

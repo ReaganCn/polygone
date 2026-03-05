@@ -6,10 +6,9 @@ export type BetRule = "5m" | "15m" | "fallback";
 
 export interface Market {
   id: string;
-  conditionId: string;   // CTF condition ID — required by redeemer.ts to call redeemPositions()
+  conditionId: string;
   question: string;
   asset: string;
-  /** Canonical duration key: "5m" | "15m" */
   duration: string;
   closesAt: string;
   timeRemainingSeconds: number;
@@ -33,13 +32,7 @@ export interface ActiveBet {
   shadow: boolean;
   side: "YES" | "NO";
   priceAtBet: number;
-  /** Which qualifying rule triggered this bet */
   rule: BetRule;
-  /**
-   * Set to true once a stop-loss sell has been initiated for this bet.
-   * Prevents the scanner from firing the stop-loss a second time on the
-   * next price tick while the first sell order is still in-flight.
-   */
   stopLossTriggered?: boolean;
 }
 
@@ -48,8 +41,15 @@ export interface OrderResult {
   orderId?: string;
   avgPrice?: number;
   filled?: boolean;
-  /** Shares actually filled (used by stop-loss to compute recovered USDC) */
+  /** Shares actually filled — used for partial-fill detection in stop-loss. */
   filledShares?: number;
+  /**
+   * USDC actually recovered from a stop-loss sell.
+   * Read directly from the CLOB response takingAmount field for a SELL order.
+   * Only set by sellPosition() — not set by placeOrder().
+   * handleStopLoss() reads this directly; no filledShares × price recomputation.
+   */
+  recoveredUsd?: number;
   error?: string;
   rawResponse?: unknown;
 }

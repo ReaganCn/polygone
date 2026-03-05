@@ -1,38 +1,56 @@
 /**
  * slots.ts — Compounding slot machine.
  *
- * Loss accounting (corrected):
+ * FIXES APPLIED:
+ *
+ * [T2] Race condition — reserveSlot() added.
+ *   handleLiveBet/handleShadowBet must call reserveSlot(slotId) synchronously
+ *   before any await. This marks the slot "active" with no activeBet yet,
+ *   so getIdleSlot() cannot hand the same slot to a concurrent qualifying event.
+ *   assignBet() is then called once the order fills to attach the real bet.
+ *   If the order fails, releaseReservedSlot() restores the slot to idle.
+ *   All three mutation functions (recordWin, recordLoss, recordStopLoss) already
+ *   guard against missing activeBet — they remain safe during the reserved window.
+ *
+ * [A2] Stop-loss recovered now exact.
+ *   RuleStats gains totalStopLossStaked (sum of stakeUsd for every SL trade).
+ *   recordStopLoss increments it alongside totalStopLossNetLost.
+ *   getSummary exposes it so api.ts can compute exact recovered =
+ *   totalStopLossStaked - totalStopLossNetLost, rather than estimating from
+ *   stopLosses × CONFIG.slotInitialUsd which was wrong for compounded slots.
+ *
+ * [S2] Seeded capital snapshot.
+ *   getSeededCapital() returns the capital actually seeded at initialiseSlots()
+ *   time (numSlots × slotInitialUsd frozen at startup). api.ts uses this for
+ *   netPnl calculation so the figure doesn't drift when POST /config changes
+ *   slotInitialUsd or numSlots mid-session.
+ *
+ * Loss accounting (unchanged):
  *   A loss wipes the STAKE (initialBalance), not the accumulated balance.
  *   If a slot had compounded to $1.10 but only bet $1 (its initialBalance),
  *   the loss destroys $1 — the extra $0.10 never left the slot.
- *   So: totalLost += bet.stakeUsd (which equals initialBalance, the actual
- *   amount at risk), not balanceBefore.
  *
- * Stop-loss accounting:
- *   recordStopLoss(slotId, recoveredUsd) is called when the sell order fills
- *   (partially or fully). recoveredUsd is the actual USDC returned from the sale.
- *   The true loss = stakeUsd - recoveredUsd.
- *   The slot is reset to initialBalance exactly like a normal loss — any
- *   compounded excess above the stake that was never extracted is forfeited.
- *
- * Per-rule statistics (5m / 15m / fallback):
- *   Each slot tracks wins/losses/profit independently per BetRule.
- *   The global getSummary() aggregates these for the /status endpoint.
+ * Stop-loss accounting (unchanged):
+ *   recordStopLoss(slotId, recoveredUsd) is called when the sell order fills.
+ *   Net loss = stakeUsd - recoveredUsd.
+ *   The slot is reset to initialBalance exactly like a normal loss.
  */
 
 import { CONFIG } from "./config.js";
 import { log } from "./logger.js";
 import type { ActiveBet, BetRule } from "./types.js";
 
-export type SlotStatus = "idle" | "active";
+export type SlotStatus = "idle" | "reserved" | "active";
 
 export interface RuleStats {
   wins: number;
   losses: number;
   stopLosses: number;
-  totalWinAmount: number;      // sum of profit per win (payout - stake)
-  totalLost: number;           // sum of ALL net losses (normal + stop-loss)
-  totalStopLossNetLost: number; // net loss from stop-loss trades only (stake - recovered)
+  totalWinAmount: number;
+  totalLost: number;
+  totalStopLossNetLost: number;
+  /** Sum of stakeUsd for every stop-loss trade — used to compute exact recovered. */
+  totalStopLossStaked: number;
 }
 
 export interface Slot {
@@ -41,23 +59,24 @@ export interface Slot {
   balance: number;
   initialBalance: number;
   totalProfitExtracted: number;
-  /** Net capital destroyed — stake minus any recovered amount from stop-loss sells */
   totalLost: number;
   wins: number;
   losses: number;
   stopLosses: number;
-  /** Per-rule breakdown */
   ruleStats: Record<BetRule, RuleStats>;
   activeBet?: ActiveBet;
 }
 
 const slots: Slot[] = [];
 
+/** Capital frozen at initialiseSlots() time — never mutated by config changes. */
+let seededCapital = 0;
+
 function emptyRuleStats(): Record<BetRule, RuleStats> {
   return {
-    "5m":      { wins: 0, losses: 0, stopLosses: 0, totalWinAmount: 0, totalLost: 0, totalStopLossNetLost: 0 },
-    "15m":     { wins: 0, losses: 0, stopLosses: 0, totalWinAmount: 0, totalLost: 0, totalStopLossNetLost: 0 },
-    "fallback":{ wins: 0, losses: 0, stopLosses: 0, totalWinAmount: 0, totalLost: 0, totalStopLossNetLost: 0 },
+    "5m":      { wins: 0, losses: 0, stopLosses: 0, totalWinAmount: 0, totalLost: 0, totalStopLossNetLost: 0, totalStopLossStaked: 0 },
+    "15m":     { wins: 0, losses: 0, stopLosses: 0, totalWinAmount: 0, totalLost: 0, totalStopLossNetLost: 0, totalStopLossStaked: 0 },
+    "fallback":{ wins: 0, losses: 0, stopLosses: 0, totalWinAmount: 0, totalLost: 0, totalStopLossNetLost: 0, totalStopLossStaked: 0 },
   };
 }
 
@@ -79,11 +98,21 @@ export function initialiseSlots(): void {
       ruleStats: emptyRuleStats(),
     });
   }
-  log.info("SLOT_STATE_SNAPSHOT", { action: "initialised", slots: getSnapshot() });
+  seededCapital = round2(CONFIG.numSlots * CONFIG.slotInitialUsd);
+  log.info("SLOT_STATE_SNAPSHOT", { action: "initialised", seededCapital, slots: getSnapshot() });
 }
 
 // ─── queries ──────────────────────────────────────────────────────────────────
 
+/**
+ * Returns the capital that was actually seeded at startup.
+ * Safe to use in P&L calculations even after POST /config changes slotInitialUsd.
+ */
+export function getSeededCapital(): number {
+  return seededCapital;
+}
+
+/** Only "idle" slots are eligible — "reserved" slots are already spoken for. */
 export function getIdleSlot(): Slot | null {
   const activeCount = Math.min(slots.length, CONFIG.numSlots);
   for (let i = 0; i < activeCount; i++) {
@@ -104,7 +133,6 @@ export function getActiveBets(): ActiveBet[] {
   return slots.flatMap((s) => (s.activeBet ? [s.activeBet] : []));
 }
 
-/** Aggregate summary across all slots, with per-rule breakdown. */
 export function getSummary() {
   const totalBalance         = slots.reduce((s, slot) => s + slot.balance, 0);
   const totalProfitExtracted = slots.reduce((s, slot) => s + slot.totalProfitExtracted, 0);
@@ -114,29 +142,28 @@ export function getSummary() {
   const totalStopLosses      = slots.reduce((s, slot) => s + slot.stopLosses, 0);
   const activeSlots          = slots.filter((s) => s.status === "active").length;
 
-  // Aggregate per-rule stats
   const rules: Record<BetRule, RuleStats> = {
-    "5m":      { wins: 0, losses: 0, stopLosses: 0, totalWinAmount: 0, totalLost: 0, totalStopLossNetLost: 0 },
-    "15m":     { wins: 0, losses: 0, stopLosses: 0, totalWinAmount: 0, totalLost: 0, totalStopLossNetLost: 0 },
-    "fallback":{ wins: 0, losses: 0, stopLosses: 0, totalWinAmount: 0, totalLost: 0, totalStopLossNetLost: 0 },
+    "5m":      { wins: 0, losses: 0, stopLosses: 0, totalWinAmount: 0, totalLost: 0, totalStopLossNetLost: 0, totalStopLossStaked: 0 },
+    "15m":     { wins: 0, losses: 0, stopLosses: 0, totalWinAmount: 0, totalLost: 0, totalStopLossNetLost: 0, totalStopLossStaked: 0 },
+    "fallback":{ wins: 0, losses: 0, stopLosses: 0, totalWinAmount: 0, totalLost: 0, totalStopLossNetLost: 0, totalStopLossStaked: 0 },
   };
   for (const slot of slots) {
     for (const rule of ["5m", "15m", "fallback"] as BetRule[]) {
-      rules[rule].wins                  += slot.ruleStats[rule].wins;
-      rules[rule].losses                += slot.ruleStats[rule].losses;
-      rules[rule].stopLosses            += slot.ruleStats[rule].stopLosses;
-      rules[rule].totalWinAmount        += slot.ruleStats[rule].totalWinAmount;
-      rules[rule].totalLost             += slot.ruleStats[rule].totalLost;
-      rules[rule].totalStopLossNetLost  += slot.ruleStats[rule].totalStopLossNetLost;
+      rules[rule].wins                 += slot.ruleStats[rule].wins;
+      rules[rule].losses               += slot.ruleStats[rule].losses;
+      rules[rule].stopLosses           += slot.ruleStats[rule].stopLosses;
+      rules[rule].totalWinAmount       += slot.ruleStats[rule].totalWinAmount;
+      rules[rule].totalLost            += slot.ruleStats[rule].totalLost;
+      rules[rule].totalStopLossNetLost += slot.ruleStats[rule].totalStopLossNetLost;
+      rules[rule].totalStopLossStaked  += slot.ruleStats[rule].totalStopLossStaked;
     }
   }
 
-  // Per-rule derived stats
   const ruleBreakdown = {} as Record<BetRule, {
     wins: number; losses: number; stopLosses: number;
     totalTrades: number; winRate: number;
     totalWinAmount: number; avgWinAmount: number;
-    totalLost: number; totalStopLossNetLost: number;
+    totalLost: number; totalStopLossNetLost: number; totalStopLossStaked: number;
     avgStopLossNetLost: number; netPnl: number;
   }>;
   for (const rule of ["5m", "15m", "fallback"] as BetRule[]) {
@@ -147,11 +174,12 @@ export function getSummary() {
       losses: r.losses,
       stopLosses: r.stopLosses,
       totalTrades,
-      winRate: totalTrades > 0 ? round2((r.wins / totalTrades) * 100) : 0,
+      winRate:              totalTrades > 0 ? round2((r.wins / totalTrades) * 100) : 0,
       totalWinAmount:       round2(r.totalWinAmount),
       avgWinAmount:         r.wins > 0 ? round2(r.totalWinAmount / r.wins) : 0,
       totalLost:            round2(r.totalLost),
       totalStopLossNetLost: round2(r.totalStopLossNetLost),
+      totalStopLossStaked:  round2(r.totalStopLossStaked),
       avgStopLossNetLost:   r.stopLosses > 0 ? round2(r.totalStopLossNetLost / r.stopLosses) : 0,
       netPnl:               round2(r.totalWinAmount - r.totalLost),
     };
@@ -183,8 +211,59 @@ export function getSummary() {
 
 // ─── mutations ────────────────────────────────────────────────────────────────
 
+/**
+ * [T2] Reserve a slot synchronously before any async order placement.
+ *
+ * Sets status to "reserved" so getIdleSlot() skips it, preventing a second
+ * concurrent qualifying event from grabbing the same slot while placeOrder
+ * is awaiting. No activeBet is set yet — that happens in assignBet() once
+ * the order fills. If the order fails, call releaseReservedSlot() to restore
+ * the slot to idle.
+ */
+export function reserveSlot(slotId: number): void {
+  const slot = findSlot(slotId);
+  if (slot.status !== "idle") {
+    throw new Error(`Slot ${slotId} is not idle (status: ${slot.status}) — cannot reserve`);
+  }
+  slot.status = "reserved";
+  log.info("SLOT_RESERVED", { slotId, balance: slot.balance });
+}
+
+/**
+ * [T2] Release a reserved slot back to idle when order placement fails.
+ * Safe to call on an already-idle slot (no-op with a warning).
+ */
+export function releaseReservedSlot(slotId: number): void {
+  const slot = findSlot(slotId);
+  if (slot.status === "active") {
+    log.warn("WARN", {
+      message: "releaseReservedSlot called on active slot — ignoring",
+      slotId,
+    });
+    return;
+  }
+  if (slot.status === "idle") {
+    log.warn("WARN", {
+      message: "releaseReservedSlot called on already-idle slot — ignoring",
+      slotId,
+    });
+    return;
+  }
+  slot.status = "idle";
+  log.info("SLOT_RELEASED", { slotId, balance: slot.balance });
+}
+
 export function assignBet(slotId: number, bet: ActiveBet): void {
   const slot = findSlot(slotId);
+  // Accept both "reserved" (normal live/shadow path) and "idle" (legacy callers
+  // or tests that skip reserveSlot). Never overwrite an already-active slot.
+  if (slot.status === "active") {
+    log.warn("WARN", {
+      message: "assignBet called on already-active slot — ignoring to prevent orphan overwrite",
+      slotId, betId: bet.betId,
+    });
+    return;
+  }
   slot.status = "active";
   slot.activeBet = bet;
   log.info("SLOT_ASSIGNED", {
@@ -203,7 +282,16 @@ export function assignBet(slotId: number, bet: ActiveBet): void {
 
 export function recordWin(slotId: number, payoutUsd: number): void {
   const slot = findSlot(slotId);
-  const bet = slot.activeBet!;
+  const bet = slot.activeBet;
+
+  if (!bet) {
+    log.warn("WARN", {
+      message: "recordWin called but slot has no activeBet — possible double-fire, ignoring",
+      slotId, payoutUsd,
+    });
+    return;
+  }
+
   const profit = payoutUsd - bet.stakeUsd;
   const balanceBefore = slot.balance;
 
@@ -244,12 +332,18 @@ export function recordWin(slotId: number, payoutUsd: number): void {
 
 export function recordLoss(slotId: number): void {
   const slot = findSlot(slotId);
-  const bet = slot.activeBet!;
-  const balanceBefore = slot.balance;
+  const bet = slot.activeBet;
 
-  // Only the STAKE is lost — not the full slot balance.
+  if (!bet) {
+    log.warn("WARN", {
+      message: "recordLoss called but slot has no activeBet — possible double-fire, ignoring",
+      slotId,
+    });
+    return;
+  }
+
+  const balanceBefore = slot.balance;
   const stakeAtRisk = bet.stakeUsd;
-  const excessForfeit = round2(Math.max(0, balanceBefore - slot.initialBalance));
 
   slot.totalLost += stakeAtRisk;
   slot.losses++;
@@ -264,7 +358,6 @@ export function recordLoss(slotId: number): void {
     stakeUsd: bet.stakeUsd,
     balanceBefore: round2(balanceBefore),
     stakeAtRisk,
-    excessForfeit,
     balanceAfter: round2(slot.balance),
     totalLostOnSlot: round2(slot.totalLost),
     shadow: bet.shadow,
@@ -278,27 +371,33 @@ export function recordLoss(slotId: number): void {
  *
  * recoveredUsd = actual USDC returned by the sell order.
  * Net loss = stakeUsd - recoveredUsd.
+ * The slot is reset to initialBalance exactly like a normal loss.
  *
- * The slot is reset to initialBalance exactly like a normal loss. Any compounded
- * gain above the stake that was never extracted is forfeited (same as recordLoss).
- * Only the NET LOSS (stake minus recovered) is counted against totalLost.
+ * [A2] Also records stakeUsd into totalStopLossStaked so api.ts can
+ * compute exact recovered = totalStopLossStaked - totalStopLossNetLost.
  */
 export function recordStopLoss(slotId: number, recoveredUsd: number): void {
   const slot = findSlot(slotId);
-  const bet = slot.activeBet!;
-  const balanceBefore = slot.balance;
+  const bet = slot.activeBet;
 
+  if (!bet) {
+    log.warn("WARN", {
+      message: "recordStopLoss called but slot has no activeBet — possible double-fire, ignoring",
+      slotId, recoveredUsd,
+    });
+    return;
+  }
+
+  const balanceBefore = slot.balance;
   const netLoss = round2(Math.max(0, bet.stakeUsd - recoveredUsd));
-  const excessForfeit = round2(Math.max(0, balanceBefore - slot.initialBalance));
 
   slot.totalLost += netLoss;
   slot.stopLosses++;
   slot.ruleStats[bet.rule].stopLosses++;
-  slot.ruleStats[bet.rule].totalLost += netLoss;
+  slot.ruleStats[bet.rule].totalLost            += netLoss;
   slot.ruleStats[bet.rule].totalStopLossNetLost += netLoss;
+  slot.ruleStats[bet.rule].totalStopLossStaked  += bet.stakeUsd;  // [A2]
 
-  // Reset balance to initial — recovered USDC goes back into the wallet,
-  // not into the slot balance (the slot starts fresh at initialBalance).
   slot.balance = slot.initialBalance;
 
   log.info("SLOT_STOP_LOSS", {
@@ -307,7 +406,6 @@ export function recordStopLoss(slotId: number, recoveredUsd: number): void {
     stakeUsd: bet.stakeUsd,
     recoveredUsd: round2(recoveredUsd),
     netLoss,
-    excessForfeit,
     balanceBefore: round2(balanceBefore),
     balanceAfter: round2(slot.balance),
     totalLostOnSlot: round2(slot.totalLost),

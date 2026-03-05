@@ -1,32 +1,27 @@
 /**
  * api.ts — Express REST API for local bot control.
- * Localhost only — no authentication.
  *
- * Endpoints:
- *   GET  /status                   Full state, P&L summary, per-rule breakdown
- *   GET  /config                   Current config (sensitive fields redacted)
- *   POST /config                   Hot-update mutable config fields
- *   POST /pause / /resume          Pause/resume new bets
- *   GET  /logs?tail=N&cat=...      Last N log lines
- *   GET  /logs/files               List all log files
+ * FIXES APPLIED:
  *
- * CHANGE (stop-loss):
- *   - /status summary now includes totalStopLosses, totalRecovered, and a
- *     stopLoss sub-object with the current trigger/limit config and aggregate
- *     fill stats so the operator can see if stop-losses are working.
- *   - /status byRule now carries stopLosses, totalRecovered, and avgNetLoss
- *     per rule, matching the new RuleStats shape from slots.ts.
- *   - /config redacts the four builder credential fields.
- *   - POST /config help text lists all current mutable keys including the three
- *     new stop-loss keys (stopLossEnabled, stopLossTriggerPrice, stopLossLimitPrice).
- *   - netPnl formula updated: stop-loss recoveries are already factored into
- *     totalLost (which stores net loss = stake − recovered), so no extra term needed.
+ * [S2] initialCapital now uses getSeededCapital() — the capital frozen at
+ *   startup — instead of CONFIG.numSlots × CONFIG.slotInitialUsd at request
+ *   time. This means netPnl stays correct even after POST /config changes
+ *   slotInitialUsd or numSlots mid-session.
+ *
+ * [A2] stopLossRecoveredByRule is now exact.
+ *   Previously estimated as stopLosses × CONFIG.slotInitialUsd, which was
+ *   wrong for compounded slots that staked more than slotInitialUsd.
+ *   Now uses totalStopLossStaked - totalStopLossNetLost from RuleStats,
+ *   both of which are tracked precisely in slots.ts recordStopLoss().
+ *
+ * [A3] stopLoss byRule netLost now shows only stop-loss net losses
+ *   (totalStopLossNetLost) instead of all losses for the rule (totalLost).
  */
 
 import express, { Request, Response } from "express";
 import { CONFIG, updateConfig } from "./config.js";
 import { log } from "./logger.js";
-import { getSnapshot, getActiveBets, getSummary } from "./slots.js";
+import { getSnapshot, getActiveBets, getSummary, getSeededCapital } from "./slots.js";
 import { pauseScanner, resumeScanner, isPausedState } from "./scanner.js";
 import type { MutableConfigKeys } from "./config.js";
 
@@ -41,52 +36,37 @@ export function startApiServer(): void {
 
     // ── P&L calculation ───────────────────────────────────────────────────────
     //
-    // initialCapital    = numSlots × slotInitialUsd  (the seed money put in)
+    // initialCapital  = capital actually seeded at startup (frozen — never
+    //                   changes if POST /config updates slotInitialUsd later).
+    //                   Sourced from getSeededCapital() in slots.ts. [S2]
     //
-    // currentBalance    = sum of all slot balances right now (includes compounded
-    //                     wins that haven't been extracted yet)
+    // currentBalance  = sum of all slot balances right now
     //
-    // profitExtracted   = USDC banked out of slots when they crossed the
-    //                     slotProfitMultiplier threshold
+    // profitExtracted = USDC banked when slots crossed slotProfitMultiplier
     //
-    // totalLost         = sum of net losses across all resolved losing trades,
-    //                     INCLUDING stop-loss trades where totalLost = stake - recovered.
-    //                     A stop-loss that recovered $0.80 of a $1 stake adds only
-    //                     $0.20 to totalLost, not $1.00.
+    // totalLost       = sum of net losses (normal losses + stop-loss net losses).
+    //                   A stop-loss recovering $0.80 of a $1 stake adds $0.20,
+    //                   not $1.00.
     //
-    // unrealisedGain    = how much the current slot balances exceed the seed capital.
-    //                     This is > 0 when slots have been compounding wins but haven't
-    //                     hit the extraction threshold yet.
+    // unrealisedGain  = how much current balances exceed seeded capital.
+    //                   Uses seededCapital (not current CONFIG) for accuracy. [S2]
     //
-    // netPnl            = profitExtracted - totalLost + unrealisedGain
-    //
-    // Note: recovered USDC from stop-losses goes back into the wallet directly;
-    // it is NOT added to slot balances. The accounting is captured entirely via
-    // the reduced totalLost figure (stake - recovered).
+    // netPnl          = profitExtracted - totalLost + unrealisedGain
     // ─────────────────────────────────────────────────────────────────────────
 
-    const initialCapital = round2(CONFIG.numSlots * CONFIG.slotInitialUsd);
+    const initialCapital = getSeededCapital();  // [S2] frozen at startup
     const unrealisedGain = round2(Math.max(0, summary.totalBalance - initialCapital));
     const netPnl         = round2(summary.totalProfitExtracted - summary.totalLost + unrealisedGain);
 
-    // Aggregate recovered USDC across all stop-loss trades.
-    // recoveredUsd per stop-loss = stakeUsd - netLoss (both tracked in ruleStats).
-    // We can derive it from the slot snapshot: totalStopLostStake - totalStopLostNet.
-    // Since slots.ts doesn't separately track totalRecovered we compute it here from
-    // the byRule data: for each rule, recoveredUsd = totalStaked_on_stop_losses - totalLost_on_stop_losses.
-    // The simpler approach: we know totalLost already deducts recovered amounts, so:
-    //   totalRecoveredUsd ≈ (totalStopLosses × CONFIG.slotInitialUsd) - stopLossContributionToTotalLost
-    // Instead, surface it cleanly per-rule from byRule where it's derivable.
     const byRule = summary.byRule;
-    const totalStopLosses     = summary.totalStopLosses;
+    const totalStopLosses = summary.totalStopLosses;
 
-    // Per-rule stop-loss recovered estimates (stake × stopLosses - netLoss per rule)
-    // Exact recovered = stakeUsd - netLoss, where stakeUsd = stopLosses × slotInitialUsd
-    // (This is an approximation since slotInitialUsd may change; the log has exact values.)
+    // [A2] Exact stop-loss recovered per rule.
+    // totalStopLossStaked and totalStopLossNetLost are both tracked precisely
+    // in slots.ts recordStopLoss(). No estimation needed.
     const stopLossRecoveredByRule = (["5m", "15m", "fallback"] as const).reduce((acc, rule) => {
       const r = byRule[rule];
-      const estimatedStaked = r.stopLosses * CONFIG.slotInitialUsd;
-      acc[rule] = round2(Math.max(0, estimatedStaked - r.totalLost));
+      acc[rule] = round2(Math.max(0, r.totalStopLossStaked - r.totalStopLossNetLost));
       return acc;
     }, {} as Record<string, number>);
 
@@ -94,6 +74,13 @@ export function startApiServer(): void {
       stopLossRecoveredByRule["5m"] +
       stopLossRecoveredByRule["15m"] +
       stopLossRecoveredByRule["fallback"]
+    );
+
+    // Total stop-loss net lost across all rules (for avgNetLoss calculation)
+    const totalStopLossNetLost = round2(
+      byRule["5m"].totalStopLossNetLost +
+      byRule["15m"].totalStopLossNetLost +
+      byRule["fallback"].totalStopLossNetLost
     );
 
     const activeBets = getActiveBets().map((b) => ({
@@ -127,7 +114,7 @@ export function startApiServer(): void {
         idleSlots:   summary.idleSlots,
 
         // ── Capital & P&L ──────────────────────────────────────────────────
-        initialCapital,
+        initialCapital,          // frozen at startup [S2]
         currentBalance:   summary.totalBalance,
         profitExtracted:  summary.totalProfitExtracted,
         totalLost:        summary.totalLost,
@@ -143,66 +130,77 @@ export function startApiServer(): void {
         avgWinAmount:    summary.avgWinAmount,
 
         // ── Stop-loss aggregate ────────────────────────────────────────────
-        // Shows current config and aggregate fill stats so the operator can
-        // verify stop-losses are triggering and recovering meaningful USDC.
         stopLoss: {
-          enabled:          CONFIG.stopLossEnabled,
-          triggerPrice:     CONFIG.stopLossTriggerPrice,
-          limitPrice:       CONFIG.stopLossLimitPrice,
-          totalTriggered:   totalStopLosses,
-          totalRecoveredUsd: totalStopLossRecovered,
-          // Average net loss per stop-loss trade.
-          // totalStopLossNetLost is tracked separately in slots.ts — it only
-          // counts stop-loss net losses (stake - recovered), not normal losses.
-          avgNetLoss: (() => {
-            const totalStopLossNetLost = round2(
-              byRule["5m"].totalStopLossNetLost +
-              byRule["15m"].totalStopLossNetLost +
-              byRule["fallback"].totalStopLossNetLost
-            );
-            return totalStopLosses > 0 ? round2(totalStopLossNetLost / totalStopLosses) : 0;
-          })(),
+          enabled:           CONFIG.stopLossEnabled,
+          triggerPrice:      CONFIG.stopLossTriggerPrice,
+          limitPrice:        CONFIG.stopLossLimitPrice,
+          totalTriggered:    totalStopLosses,
+          totalRecoveredUsd: totalStopLossRecovered,  // exact [A2]
+          totalNetLost:      totalStopLossNetLost,     // stop-loss losses only [A3]
+          avgNetLoss:        totalStopLosses > 0
+            ? round2(totalStopLossNetLost / totalStopLosses)
+            : 0,
           byRule: {
-            "5m":      { triggered: byRule["5m"].stopLosses,      recovered: stopLossRecoveredByRule["5m"],      netLost: byRule["5m"].totalLost },
-            "15m":     { triggered: byRule["15m"].stopLosses,     recovered: stopLossRecoveredByRule["15m"],     netLost: byRule["15m"].totalLost },
-            "fallback":{ triggered: byRule["fallback"].stopLosses, recovered: stopLossRecoveredByRule["fallback"], netLost: byRule["fallback"].totalLost },
+            // [A3] netLost is now totalStopLossNetLost (SL trades only),
+            //      not totalLost (which includes normal losses too).
+            "5m": {
+              triggered: byRule["5m"].stopLosses,
+              recovered: stopLossRecoveredByRule["5m"],
+              netLost:   round2(byRule["5m"].totalStopLossNetLost),  // [A3]
+            },
+            "15m": {
+              triggered: byRule["15m"].stopLosses,
+              recovered: stopLossRecoveredByRule["15m"],
+              netLost:   round2(byRule["15m"].totalStopLossNetLost),  // [A3]
+            },
+            "fallback": {
+              triggered: byRule["fallback"].stopLosses,
+              recovered: stopLossRecoveredByRule["fallback"],
+              netLost:   round2(byRule["fallback"].totalStopLossNetLost),  // [A3]
+            },
           },
         },
 
         // ── Per-rule full breakdown ────────────────────────────────────────
         byRule: {
           "5m": {
-            wins:           byRule["5m"].wins,
-            losses:         byRule["5m"].losses,
-            stopLosses:     byRule["5m"].stopLosses,
-            totalTrades:    byRule["5m"].totalTrades,
-            winRate:        byRule["5m"].winRate,
-            totalWinAmount: byRule["5m"].totalWinAmount,
-            avgWinAmount:   byRule["5m"].avgWinAmount,
-            totalLost:      byRule["5m"].totalLost,
-            netPnl:         byRule["5m"].netPnl,
+            wins:                byRule["5m"].wins,
+            losses:              byRule["5m"].losses,
+            stopLosses:          byRule["5m"].stopLosses,
+            totalTrades:         byRule["5m"].totalTrades,
+            winRate:             byRule["5m"].winRate,
+            totalWinAmount:      byRule["5m"].totalWinAmount,
+            avgWinAmount:        byRule["5m"].avgWinAmount,
+            totalLost:           byRule["5m"].totalLost,
+            totalStopLossNetLost:byRule["5m"].totalStopLossNetLost,
+            totalStopLossStaked: byRule["5m"].totalStopLossStaked,
+            netPnl:              byRule["5m"].netPnl,
           },
           "15m": {
-            wins:           byRule["15m"].wins,
-            losses:         byRule["15m"].losses,
-            stopLosses:     byRule["15m"].stopLosses,
-            totalTrades:    byRule["15m"].totalTrades,
-            winRate:        byRule["15m"].winRate,
-            totalWinAmount: byRule["15m"].totalWinAmount,
-            avgWinAmount:   byRule["15m"].avgWinAmount,
-            totalLost:      byRule["15m"].totalLost,
-            netPnl:         byRule["15m"].netPnl,
+            wins:                byRule["15m"].wins,
+            losses:              byRule["15m"].losses,
+            stopLosses:          byRule["15m"].stopLosses,
+            totalTrades:         byRule["15m"].totalTrades,
+            winRate:             byRule["15m"].winRate,
+            totalWinAmount:      byRule["15m"].totalWinAmount,
+            avgWinAmount:        byRule["15m"].avgWinAmount,
+            totalLost:           byRule["15m"].totalLost,
+            totalStopLossNetLost:byRule["15m"].totalStopLossNetLost,
+            totalStopLossStaked: byRule["15m"].totalStopLossStaked,
+            netPnl:              byRule["15m"].netPnl,
           },
           "fallback": {
-            wins:           byRule["fallback"].wins,
-            losses:         byRule["fallback"].losses,
-            stopLosses:     byRule["fallback"].stopLosses,
-            totalTrades:    byRule["fallback"].totalTrades,
-            winRate:        byRule["fallback"].winRate,
-            totalWinAmount: byRule["fallback"].totalWinAmount,
-            avgWinAmount:   byRule["fallback"].avgWinAmount,
-            totalLost:      byRule["fallback"].totalLost,
-            netPnl:         byRule["fallback"].netPnl,
+            wins:                byRule["fallback"].wins,
+            losses:              byRule["fallback"].losses,
+            stopLosses:          byRule["fallback"].stopLosses,
+            totalTrades:         byRule["fallback"].totalTrades,
+            winRate:             byRule["fallback"].winRate,
+            totalWinAmount:      byRule["fallback"].totalWinAmount,
+            avgWinAmount:        byRule["fallback"].avgWinAmount,
+            totalLost:           byRule["fallback"].totalLost,
+            totalStopLossNetLost:byRule["fallback"].totalStopLossNetLost,
+            totalStopLossStaked: byRule["fallback"].totalStopLossStaked,
+            netPnl:              byRule["fallback"].netPnl,
           },
         },
       },
@@ -214,7 +212,6 @@ export function startApiServer(): void {
 
   // ── GET /config ──────────────────────────────────────────────────────────────
   app.get("/config", (_req: Request, res: Response) => {
-    // Destructure all sensitive fields so none leak into the response
     const {
       privateKey,
       polyApiKey, polySecret, polyPassphrase,
@@ -224,13 +221,10 @@ export function startApiServer(): void {
 
     res.json({
       ...safe,
-      // Wallet
-      privateKey:     "[REDACTED]",
-      // CLOB credentials
-      polyApiKey:           polyApiKey           ? "[SET]" : "[NOT SET]",
-      polySecret:           polySecret           ? "[SET]" : "[NOT SET]",
-      polyPassphrase:       polyPassphrase       ? "[SET]" : "[NOT SET]",
-      // Builder credentials (auto-redemption)
+      privateKey:            "[REDACTED]",
+      polyApiKey:            polyApiKey            ? "[SET]" : "[NOT SET]",
+      polySecret:            polySecret            ? "[SET]" : "[NOT SET]",
+      polyPassphrase:        polyPassphrase        ? "[SET]" : "[NOT SET]",
       polyBuilderApiKey:     polyBuilderApiKey     ? "[SET]" : "[NOT SET]",
       polyBuilderSecret:     polyBuilderSecret     ? "[SET]" : "[NOT SET]",
       polyBuilderPassphrase: polyBuilderPassphrase ? "[SET]" : "[NOT SET]",
@@ -252,48 +246,26 @@ export function startApiServer(): void {
       res.status(400).json({
         error: "No recognised mutable config keys in body.",
         mutableKeys: [
-          // Scanning
-          "scanIntervalMs",
-          "targetAssets",
-          // Market type toggles
-          "enable5m",
-          "enable15m",
-          "enableFallback",
-          // Price ranges
-          "priceRangeMin5m",
-          "priceRangeMax5m",
-          "priceRangeMin15m",
-          "priceRangeMax15m",
-          // Time-remaining windows
-          "maxTimeRemaining5m",
-          "maxTimeRemaining15m",
-          // Fallback rule
-          "fallbackTimeRemaining5m",
-          "fallbackTimeRemaining15m",
-          "fallbackMinPrice",
-          "fallbackMaxPrice",
-          // Stop-loss
-          "stopLossEnabled",
-          "stopLossTriggerPrice",
-          "stopLossLimitPrice",
-          // Order execution
+          "scanIntervalMs", "targetAssets",
+          "enable5m", "enable15m", "enableFallback",
+          "priceRangeMin5m", "priceRangeMax5m",
+          "priceRangeMin15m", "priceRangeMax15m",
+          "maxTimeRemaining5m", "maxTimeRemaining15m",
+          "fallbackTimeRemaining5m", "fallbackTimeRemaining15m",
+          "fallbackMinPrice", "fallbackMaxPrice",
+          "stopLossEnabled", "stopLossTriggerPrice", "stopLossLimitPrice",
           "orderType",
-          // Slot / compounding
-          "numSlots",
-          "slotInitialUsd",
-          "slotProfitMultiplier",
-          // Mode
+          "numSlots", "slotInitialUsd", "slotProfitMultiplier",
           "shadowMode",
         ],
+        note: "numSlots and slotInitialUsd changes take effect for new sessions only. " +
+              "Changing them mid-session affects config display but not running slots.",
         examples: {
-          "enable stop-loss at 49¢":          { stopLossEnabled: true, stopLossTriggerPrice: 0.49 },
-          "tighten stop-loss floor to 10¢":   { stopLossLimitPrice: 0.10 },
-          "disable stop-loss":                { stopLossEnabled: false },
-          "disable 5m markets":               { enable5m: false },
-          "only use fallback":                { enable5m: false, enable15m: false, enableFallback: true },
-          "set 15m price range":              { priceRangeMin15m: 0.96, priceRangeMax15m: 0.99 },
-          "set max time remaining (5m)":      { maxTimeRemaining5m: 120 },
-          "set max time remaining (15m)":     { maxTimeRemaining15m: 300 },
+          "enable stop-loss at 49¢":        { stopLossEnabled: true, stopLossTriggerPrice: 0.49 },
+          "tighten stop-loss floor to 10¢": { stopLossLimitPrice: 0.10 },
+          "disable stop-loss":              { stopLossEnabled: false },
+          "disable 5m markets":             { enable5m: false },
+          "set 15m price range":            { priceRangeMin15m: 0.96, priceRangeMax15m: 0.99 },
         },
       });
       return;

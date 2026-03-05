@@ -21,11 +21,32 @@
  * Rules are checked in order: 5m → 15m → fallback.
  * A market only fires one callback per evaluation (first matching rule wins).
  *
- * CHANGE (stop-loss):
- *   Every live price update for a TRACKED market (one with an active bet) is
- *   checked against CONFIG.stopLossTriggerPrice. If the win-side price drops
- *   below that threshold and stopLossEnabled is true, handleStopLoss() is called
- *   in trader.ts. The bet's stopLossTriggered flag prevents duplicate calls.
+ * FIXES APPLIED:
+ *
+ * [SC2] Heartbeat no longer overwrites real-time WebSocket prices with stale
+ *   Gamma API data. refreshKnownMarkets now preserves the winSidePrice,
+ *   winSide, and tokenIdToBuy from the existing knownMarkets entry when
+ *   refreshing a market that is already known. Those fields are kept current
+ *   by handlePriceUpdate (WebSocket). Gamma is only authoritative for
+ *   structural fields (conditionId, closesAt, tickSize, tokenIds, question).
+ *   Without this fix, a heartbeat running every 4s could silently reset a
+ *   crashed price (e.g. 0.48) back to the stale Gamma price (e.g. 0.94),
+ *   suppressing the stop-loss check on the very next evaluateAndFire tick.
+ *
+ * [SC3] handleWsMarketResolved no longer calls trackedMarketIds.delete()
+ *   directly. It was calling the delete BEFORE firing onMarketResolvedCb,
+ *   which meant the trackedMarketIds state was modified out of order with
+ *   trader.ts's own cleanup (untrackMarket is called from handleWsResolution
+ *   which is the target of onMarketResolvedCb). The direct delete is removed;
+ *   untrackMarket via trader.ts is now the single authority.
+ *
+ * [SC4] Stop-loss betTokenPrice fallback changed from `price` to 0.
+ *   If getTokenPrice(betTokenId) returns undefined (WebSocket dropped, no
+ *   cached price), the old fallback used `price` — the price of whichever
+ *   token just fired the price update, which may be the OTHER side's token
+ *   after a market flip. That could give a false 0.95 reading and suppress
+ *   the stop-loss. Falling back to 0 is conservative: it always triggers the
+ *   stop-loss check, which is safer than silently suppressing it.
  */
 
 import { CONFIG } from "./config.js";
@@ -146,14 +167,32 @@ async function refreshKnownMarkets(): Promise<void> {
   const newTokenIds: string[] = [];
 
   for (const market of markets) {
-    if (!knownMarkets.has(market.id)) {
+    const existing = knownMarkets.get(market.id);
+
+    if (!existing) {
+      // Brand new market — store as-is from Gamma
       knownMarkets.set(market.id, market);
       tokenToMarket.set(market.yesTokenId, market.id);
       tokenToMarket.set(market.noTokenId, market.id);
       newTokenIds.push(market.yesTokenId, market.noTokenId);
       newCount++;
     } else {
-      knownMarkets.set(market.id, market);
+      // [SC2] Market already known. Gamma is the authority for structural fields
+      // (closesAt, conditionId, tickSize, question, tokenIds, negRisk) but the
+      // WebSocket is the authority for price fields (winSidePrice, winSide,
+      // tokenIdToBuy). Preserve the WebSocket-updated price fields so a
+      // heartbeat tick can't silently reset a real-time price crash back to a
+      // stale Gamma value and suppress the stop-loss check.
+      knownMarkets.set(market.id, {
+        ...market,                          // take structural fields from Gamma
+        winSidePrice:  existing.winSidePrice,  // keep real-time WebSocket price
+        winSide:       existing.winSide,       // keep real-time win side
+        tokenIdToBuy:  existing.tokenIdToBuy,  // keep real-time token to buy
+        timeRemainingSeconds: Math.max(       // recompute from authoritative closesAt
+          0,
+          Math.floor((new Date(market.closesAt).getTime() - now) / 1000)
+        ),
+      });
     }
   }
 
@@ -230,7 +269,15 @@ function handlePriceUpdate(tokenId: string, price: TokenPrice): void {
 function handleWsMarketResolved(event: ResolvedMarketEvent): void {
   if (!onMarketResolvedCb) return;
   log.info("INFO", { message: "WS market_resolved", marketId: event.marketId, winningOutcome: event.winningOutcome });
+
+  // [SC3] Fire the resolution callback first. trader.ts handleWsResolution will
+  // call untrackMarket(marketId) as part of its cleanup — that is the single
+  // authority for removing a market from trackedMarketIds. Do NOT call
+  // trackedMarketIds.delete here; doing so before the callback would cause the
+  // cleanup to happen out of order with trader.ts state.
   onMarketResolvedCb(event.marketId, event.winningTokenId, event.winningOutcome);
+
+  // Clean up our own local maps after the callback has settled the bet.
   const market = knownMarkets.get(event.marketId);
   if (market) {
     knownMarkets.delete(event.marketId);
@@ -238,7 +285,9 @@ function handleWsMarketResolved(event: ResolvedMarketEvent): void {
     tokenToMarket.delete(market.noTokenId);
     unsubscribeTokenIds([market.yesTokenId, market.noTokenId]);
   }
-  trackedMarketIds.delete(event.marketId);
+  // trackedMarketIds is managed solely by trackMarket/untrackMarket.
+  // trader.ts calls untrackMarket(marketId) from handleWsResolution, which
+  // is called synchronously above via onMarketResolvedCb. No delete needed here.
 }
 
 async function handleWsNewMarket(event: NewMarketEvent): Promise<void> {
@@ -303,9 +352,20 @@ function evaluateAndFire(market: Market, price: number, source: string): void {
   // token. getBetTokenId() returns the tokenIdToBuy frozen at bet placement time.
   if (isTracked && CONFIG.stopLossEnabled) {
     const betTokenId = getBetTokenId(market.id);
-    const betTokenPrice = betTokenId ? (getTokenPrice(betTokenId)?.bestAsk ?? price) : price;
+
+    // [SC4] Fall back to 0 (not `price`) when the bet token has no cached
+    // WebSocket price. `price` is the price of whichever token triggered this
+    // evaluation — after a market flip it may be the OTHER side's token, giving
+    // a falsely high reading that suppresses the stop-loss. 0 is conservative:
+    // it always triggers the check, ensuring the stop-loss is never silently
+    // missed due to a missing price. handleStopLoss is idempotent (guarded by
+    // stopLossTriggered) so spurious calls are safe.
+    const betTokenPrice = betTokenId
+      ? (getTokenPrice(betTokenId)?.bestAsk ?? 0)
+      : 0;
+
     if (betTokenPrice < CONFIG.stopLossTriggerPrice) {
-    // Fire-and-forget — handleStopLoss is async but we don't block the price loop
+      // Fire-and-forget — handleStopLoss is async but we don't block the price loop
       handleStopLoss(market.id).catch((err) =>
         log.error("ERROR", {
           message: "Uncaught error in handleStopLoss",

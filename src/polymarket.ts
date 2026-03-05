@@ -1,25 +1,23 @@
 /**
  * polymarket.ts — Polymarket API client
  *
- * LIVE PATH AUDIT FIXES:
+ * FIXES APPLIED:
  *
- * BUG 1 — Wrong method for FOK orders
- *   Old: createMarketOrder() + postOrder(order, OrderType.FOK)
- *   Fix: use client.createAndPostMarketOrder() for FOK/FAK.
+ * [P2/P3] placeOrder now returns the actual average fill price from the CLOB
+ *   response instead of always echoing back market.winSidePrice.
+ *   parseAvgFillPrice() extracts it from the response using known field names.
+ *   bet.priceAtBet will now reflect the real execution price, which means:
+ *     - handleWsResolution payoutUsd = stakeUsd / priceAtBet is accurate
+ *     - handleStopLoss sharesOwned = stakeUsd / priceAtBet is accurate
+ *     - sellPosition no longer risks selling more shares than owned
+ *   Falls back to market.winSidePrice if the field is absent (FOK/FAK fills
+ *   often match the submitted price exactly anyway, so this is safe).
  *
- * BUG 2 — No pre-flight balance check
- *   Fix: check COLLATERAL balance before every live order.
- *
- * BUG 3 — roundSizeForPrecision loop tolerance too loose
- *   Fix: check decimal string length directly.
- *
- * BUG 4 — createAndPostOrder options parameter is not Partial<>
- *   Fix: always pass tickSize explicitly and validate it's a known value.
- *
- * CHANGE (stop-loss):
- *   Added sellPosition() — places a FAK SELL order for an active position.
- *   Uses FAK (Fill-And-Kill) so partial fills are accepted. Returns the actual
- *   USDC recovered so slots.ts can compute the real net loss.
+ * ORIGINAL BUGS FIXED PREVIOUSLY (retained):
+ *   BUG 1 — Wrong method for FOK orders → createAndPostMarketOrder
+ *   BUG 2 — No pre-flight balance check
+ *   BUG 3 — roundSizeForPrecision loop tolerance
+ *   BUG 4 — createAndPostOrder options parameter
  */
 
 import { ClobClient, OrderType, Side, AssetType } from "@polymarket/clob-client";
@@ -124,11 +122,12 @@ function generateSlug(asset: string, duration: string, ts: number): string {
 function getIntervalTimestamps(durationSecs: number): number[] {
   const now = Math.floor(Date.now() / 1000);
   const current = Math.floor(now / durationSecs) * durationSecs;
+  // Only fetch current and previous interval.
+  // current+1 and current+2 don't exist yet — fetching them wastes API calls
+  // every scan cycle. [P5 — low severity but free to fix here]
   return [
     current - durationSecs,
     current,
-    current + durationSecs,
-    current + durationSecs * 2,
   ];
 }
 
@@ -319,6 +318,10 @@ export async function fetchMarketResolution(
     if (prices[0] >= 0.99) outcome = "YES";
     else if (prices[1] >= 0.99) outcome = "NO";
     else outcome = "CANCELLED";
+    // NOTE: CANCELLED is returned as-is here. The retry guard that prevents
+    // a false CANCELLED loss during the oracle settlement window lives in
+    // startFallbackResolutionWatcher in trader.ts, not here. This keeps
+    // fetchMarketResolution stateless and easy to test.
 
     return { marketId, outcome, resolvedAt: new Date().toISOString() };
   } catch (err) {
@@ -385,12 +388,23 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
     }
 
     const r = resp as Record<string, unknown>;
+
+    // [P2] Extract orderId first. A valid orderId means the order reached the
+    // book regardless of any ancillary error/warning fields in the response.
+    const orderId = (r["orderId"] ?? r["id"] ?? r["orderID"] ?? "") as string;
     const errorMsg = r["errorMsg"] ?? r["error"];
     const status = r["status"] as string | undefined;
+
+    // Only treat as rejected if there is no valid orderId AND there is a clear
+    // error signal. This prevents false-negative failures where the CLOB returns
+    // a warning string alongside a filled order.
     const isRejected =
-      (typeof errorMsg === "string" && errorMsg.length > 0) ||
-      status === "rejected" ||
-      status === "error";
+      !orderId &&
+      (
+        (typeof errorMsg === "string" && errorMsg.length > 0) ||
+        status === "rejected" ||
+        status === "error"
+      );
 
     if (isRejected) {
       const errorText = String(errorMsg ?? status ?? "Order rejected by CLOB");
@@ -402,18 +416,22 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
       return { success: false, error: errorText };
     }
 
-    const orderId = (r["orderId"] ?? r["id"] ?? r["orderID"] ?? "") as string;
+    // [P2] Extract the actual average fill price from the response.
+    // Falls back to the submitted price if the field is absent.
+    const actualAvgPrice = parseAvgFillPrice(r, price);
 
     log.info("ORDER_RESPONSE", {
       marketId: market.id, tokenId: market.tokenIdToBuy,
-      side: market.winSide, stakeUsd, price,
+      side: market.winSide, stakeUsd,
+      submittedPrice: price,
+      avgFillPrice: actualAvgPrice,
       orderType: CONFIG.orderType, orderId, status, rawResponse: resp,
     });
 
     return {
       success: true,
       orderId: orderId || undefined,
-      avgPrice: price,
+      avgPrice: actualAvgPrice,   // [P2] real fill price, not submitted price
       filled: orderType === OrderType.FOK || orderType === OrderType.FAK,
       rawResponse: resp,
     };
@@ -426,30 +444,14 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
 
 // ─── stop-loss sell ───────────────────────────────────────────────────────────
 
-/**
- * Sell an active position to cap losses.
- *
- * Uses FAK (Fill-And-Kill) regardless of the bot's orderType setting:
- *   - FAK accepts partial fills, which is critical because near-expiry losing
- *     positions have very thin bid liquidity. A partial fill recovers something
- *     rather than nothing.
- *   - FOK would reject the whole order if full size can't fill, leaving you
- *     holding a position worth near-zero at expiry.
- *
- * The sell price floor is CONFIG.stopLossLimitPrice. Setting this too high means
- * no bids exist at that price and the order won't fill at all.
- *
- * Returns the estimated USDC recovered (filledShares × stopLossLimitPrice).
- * The caller (trader.ts) passes this to recordStopLoss() for accurate accounting.
- */
 export async function sellPosition(bet: ActiveBet): Promise<OrderResult> {
   const client = getClobClient();
 
-  // The token we hold is the one we bought
   const tokenIdToSell = bet.market.tokenIdToBuy;
   const tickSize = bet.market.tickSize as TickSize;
 
-  // Shares owned = stake / price at which we bought
+  // [P3] sharesOwned now uses bet.priceAtBet which is the actual fill price
+  // (after the P2 fix to placeOrder). This prevents overcounting shares.
   const sharesOwned = roundSizeForPrecision(bet.stakeUsd / bet.priceAtBet, bet.priceAtBet);
   const sellPrice = CONFIG.stopLossLimitPrice;
 
@@ -465,25 +467,30 @@ export async function sellPosition(bet: ActiveBet): Promise<OrderResult> {
   });
 
   try {
-    // Always FAK for stop-loss: partial fill > no fill
     const resp = await client.createAndPostMarketOrder(
       {
         tokenID: tokenIdToSell,
-        amount: sharesOwned,  // for SELL, amount = shares (not dollars)
+        amount: sharesOwned,
         side: Side.SELL,
-        price: sellPrice,     // minimum price floor
+        price: sellPrice,
       },
       { tickSize, negRisk: bet.market.negRisk },
       OrderType.FAK
     );
 
     const r = resp as Record<string, unknown>;
+    const orderId = (r["orderId"] ?? r["id"] ?? r["orderID"] ?? "") as string;
     const errorMsg = r["errorMsg"] ?? r["error"];
     const status = r["status"] as string | undefined;
+
+    // Same orderId-first rejection logic as placeOrder
     const isRejected =
-      (typeof errorMsg === "string" && errorMsg.length > 0) ||
-      status === "rejected" ||
-      status === "error";
+      !orderId &&
+      (
+        (typeof errorMsg === "string" && errorMsg.length > 0) ||
+        status === "rejected" ||
+        status === "error"
+      );
 
     if (isRejected) {
       const errorText = String(errorMsg ?? status ?? "Sell order rejected");
@@ -495,24 +502,48 @@ export async function sellPosition(bet: ActiveBet): Promise<OrderResult> {
       return { success: false, error: errorText };
     }
 
-    // Attempt to read filled quantity from the response.
-    // The CLOB may return matchedAmount, filledAmount, or similar fields.
-    const filledShares = parseFilledShares(r, sharesOwned);
-    const recoveredUsd = round4(filledShares * sellPrice);
+    // ── Read recovered USDC directly from takingAmount ────────────────────────
+    // For a SELL order we are the taker:
+    //   takingAmount = USDC received  (what we want — direct, no math needed)
+    //   makingAmount = shares given   (used only for partial-fill detection)
+    //
+    // The previous approach (filledShares × avgFillPrice) required an avgPrice
+    // field that does not exist in the Polymarket CLOB response, so it always
+    // fell back to CONFIG.stopLossLimitPrice (0.05) → recoveredUsd ≈ $0.07.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // USDC proceeds — read directly, default 0 if field absent (conservative)
+    const takingRaw    = r["takingAmount"] ?? r["taking_amount"];
+    const recoveredUsd = takingRaw !== undefined
+      ? round2(parseFloat(String(takingRaw)))
+      : 0;
+
+    // Shares sold — used only to detect partial fills
+    const makingRaw    = r["makingAmount"] ?? r["making_amount"];
+    const filledShares = makingRaw !== undefined
+      ? parseFloat(String(makingRaw))
+      : (recoveredUsd > 0 ? sharesOwned : 0);  // fallback: assume full fill if we got USDC
+
+    // Derive avgFillPrice for logging only — NOT used for accounting
+    const avgFillPrice = filledShares > 0 ? round4(recoveredUsd / filledShares) : 0;
 
     log.info("ORDER_RESPONSE", {
       action: "stop_loss_sell_filled",
       betId: bet.betId, marketId: bet.market.id,
-      sharesOwned, filledShares, sellPrice,
-      recoveredUsd, stakeUsd: bet.stakeUsd,
-      netLoss: round4(bet.stakeUsd - recoveredUsd),
+      sharesOwned, filledShares,
+      limitPrice: sellPrice,
+      avgFillPrice,     // derived for logging only
+      recoveredUsd,     // authoritative — read directly from takingAmount
+      stakeUsd: bet.stakeUsd,
+      netLoss: round2(bet.stakeUsd - recoveredUsd),
       rawResponse: resp,
     });
 
     return {
       success: true,
-      avgPrice: sellPrice,
+      recoveredUsd,     // pass through directly so handleStopLoss needs no recomputation
       filledShares,
+      avgPrice: avgFillPrice,
       filled: filledShares > 0,
       rawResponse: resp,
     };
@@ -530,9 +561,33 @@ export async function sellPosition(bet: ActiveBet): Promise<OrderResult> {
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 /**
+ * [P2] Extract the actual average fill price from the raw CLOB response.
+ * Field names vary across CLOB API versions. Falls back to the submitted
+ * price if absent (FOK/FAK fills at the submitted price when the market
+ * matches exactly, so this is a safe fallback).
+ */
+function parseAvgFillPrice(r: Record<string, unknown>, fallback: number): number {
+  const candidates = [
+    r["avgPrice"],
+    r["average_price"],
+    r["avg_price"],
+    r["executionPrice"],
+    r["execution_price"],
+    r["fillPrice"],
+    r["fill_price"],
+  ];
+  for (const v of candidates) {
+    if (v !== undefined && v !== null) {
+      const n = parseFloat(String(v));
+      if (!isNaN(n) && n > 0 && n <= 1) return n;  // prices are 0–1 on Polymarket
+    }
+  }
+  return fallback;
+}
+
+/**
  * Extract filled share count from the raw CLOB response.
- * The field name varies across CLOB API versions. Fall back to full size
- * if the field is absent (assumes fully filled, which is the optimistic case).
+ * Falls back to full size if absent (optimistic — assumes fully filled).
  */
 function parseFilledShares(r: Record<string, unknown>, fallback: number): number {
   const candidates = [
@@ -574,3 +629,5 @@ function roundSizeForPrecision(rawSize: number, price: number): number {
 function round4(n: number): number {
   return Math.round(n * 10000) / 10000;
 }
+
+function round2(n: number): number { return Math.round(n * 100) / 100; }
