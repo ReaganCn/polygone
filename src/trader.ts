@@ -72,51 +72,36 @@ export function handleWsResolution(
   const bet = activeBetsByMarketId.get(marketId);
   if (!bet) return;
 
-  activeBetsByMarketId.delete(marketId);
-
+  // Normalise and check win/loss
   const normalised = normaliseOutcome(winningOutcome, winningTokenId, bet);
   const won = bet.side === normalised;
 
   if (won) {
     const payoutUsd = Math.round((bet.stakeUsd / bet.priceAtBet) * 100) / 100;
-
+    
     log.info(bet.shadow ? "SHADOW_RESOLUTION_WIN" : "RESOLUTION_WIN", {
-      source: "websocket",
-      betId: bet.betId, slotId: bet.slotId, orderId: bet.orderId,
-      marketId, question: bet.market.question,
-      betSide: bet.side, winningOutcome, normalisedOutcome: normalised,
-      stakeUsd: bet.stakeUsd, payoutUsd,
-      profitUsd: Math.round((payoutUsd - bet.stakeUsd) * 100) / 100,
-      priceAtBet: bet.priceAtBet, rule: bet.rule,
+      betId: bet.betId,
+      question: bet.market.question,
+      payoutUsd
     });
 
     recordWin(bet.slotId, payoutUsd);
 
-    // ── trigger redemption so USDC becomes spendable immediately ─────────────
-    // Fire-and-forget — we don't await because the slot can already start
-    // tracking the next bet. Redemption confirmation is logged by redeemer.ts.
+    // FIX: Pass the full bet.market object instead of just conditionId
     if (!bet.shadow) {
-      redeemAfterWin(bet.market.conditionId, bet.market.question).catch(
-        (err) =>
-          log.error("REDEEM_UNCAUGHT", {
-            marketId,
-            error: (err as Error).message,
-          })
+      redeemAfterWin(bet.market).catch(err => 
+        log.error("REDEEM_UNCAUGHT", { marketId, error: err.message })
       );
     }
-    // ─────────────────────────────────────────────────────────────────────────
-
   } else {
     log.info(bet.shadow ? "SHADOW_RESOLUTION_LOSS" : "RESOLUTION_LOSS", {
-      source: "websocket",
-      betId: bet.betId, slotId: bet.slotId, orderId: bet.orderId,
-      marketId, question: bet.market.question,
-      betSide: bet.side, winningOutcome, normalisedOutcome: normalised,
-      stakeUsd: bet.stakeUsd, rule: bet.rule,
+      betId: bet.betId,
+      question: bet.market.question
     });
     recordLoss(bet.slotId);
   }
 
+  activeBetsByMarketId.delete(marketId);
   untrackMarket(marketId);
 }
 

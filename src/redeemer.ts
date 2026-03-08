@@ -1,251 +1,128 @@
-/**
- * redeemer.ts — Auto-redeems winning Polymarket positions back into USDC.
- *
- * Why this is needed:
- *   When a bet resolves as a WIN, the payout is NOT automatically credited as
- *   spendable USDC. Instead, you hold ERC-1155 conditional tokens (the winning
- *   outcome tokens) that must be explicitly redeemed by calling redeemPositions()
- *   on Polymarket's Conditional Token Framework (CTF) contract.
- */
-
-import {
-  createWalletClient,
-  http,
-  encodeFunctionData,
-  zeroHash,
-  type Hex,
-} from "viem";
-import { privateKeyToAccount } from "viem/accounts";
+import { createPublicClient, http, encodeFunctionData, zeroHash, type Hex } from "viem";
 import { polygon } from "viem/chains";
-import {
-  RelayClient,
-  RelayerTxType,
-  type Transaction,
-} from "@polymarket/builder-relayer-client";
+import { RelayClient, RelayerTxType, type Transaction } from "@polymarket/builder-relayer-client";
 import { BuilderConfig } from "@polymarket/builder-signing-sdk";
+import { privateKeyToAccount } from "viem/accounts";
+import { createWalletClient } from "viem";
 
 import { CONFIG } from "./config.js";
 import { log } from "./logger.js";
+import type { Market } from "./types.js";
 
-// ─── Polygon contract addresses (never change) ────────────────────────────────
-
+// ─── Contract Constants ──────────────────────────────────────────────────────
 const CTF_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
+const NEG_RISK_ADAPTER = "0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296";
 const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
-const RELAYER_URL = "https://relayer-v2.polymarket.com";
-const CHAIN_ID = 137;
-const DATA_API = "https://data-api.polymarket.com";
 
-// ─── ABI (minimal) ───────────────────────────────────────────────────────────
-
-const CTF_REDEEM_ABI = [
-  {
-    constant: false,
-    inputs: [
-      { name: "collateralToken", type: "address" },
-      { name: "parentCollectionId", type: "bytes32" },
-      { name: "conditionId", type: "bytes32" },
-      { name: "indexSets", type: "uint256[]" },
-    ],
-    name: "redeemPositions",
-    outputs: [],
-    payable: false,
-    stateMutability: "nonpayable",
-    type: "function",
-  },
+// ─── ABIs ───────────────────────────────────────────────────────────────────
+const CTF_ABI = [
+  { name: "redeemPositions", type: "function", inputs: [{ name: "collateralToken", type: "address" }, { name: "parentCollectionId", type: "bytes32" }, { name: "conditionId", type: "bytes32" }, { name: "indexSets", type: "uint256[]" }] },
+  { name: "payoutNumerators", type: "function", inputs: [{ name: "conditionId", type: "bytes32" }], outputs: [{ type: "uint256[]" }] },
+  { name: "balanceOf", type: "function", inputs: [{ name: "account", type: "address" }, { name: "id", type: "uint256" }], outputs: [{ type: "uint256" }] }
 ] as const;
 
-// ─── Types ────────────────────────────────────────────────────────────────────
+const NEG_RISK_ABI = [
+  { name: "redeemPositions", type: "function", inputs: [{ name: "ctf", type: "address" }, { name: "collateralToken", type: "address" }, { name: "parentCollectionId", type: "bytes32" }, { name: "conditionId", type: "bytes32" }, { name: "indexSets", type: "uint256[]" }] }
+] as const;
 
-interface RedeemablePosition {
-  conditionId: string;
-  outcomeIndex: number;
-  size: number;
-  title: string;
-}
+const publicClient = createPublicClient({ 
+  chain: polygon, 
+  transport: http(process.env.POLYGON_RPC_URL ?? "https://polygon-rpc.com") 
+});
 
-// ─── Relay client (lazy singleton) ───────────────────────────────────────────
-
+// ─── Helper: Get Relayer Client ──────────────────────────────────────────────
 let _relayClient: RelayClient | null = null;
-
 function getRelayClient(): RelayClient {
   if (_relayClient) return _relayClient;
-
-  const builderApiKey = process.env.POLY_BUILDER_API_KEY;
-  const builderSecret = process.env.POLY_BUILDER_SECRET;
-  const builderPassphrase = process.env.POLY_BUILDER_PASSPHRASE;
-  const rpcUrl = process.env.POLYGON_RPC_URL ?? "https://polygon-rpc.com";
-
-  if (!builderApiKey || !builderSecret || !builderPassphrase) {
-    throw new Error(
-      "Missing POLY_BUILDER_API_KEY / POLY_BUILDER_SECRET / POLY_BUILDER_PASSPHRASE. " +
-        "Generate them at polymarket.com/settings?tab=builder and add them to .env."
-    );
-  }
-
   const account = privateKeyToAccount(CONFIG.privateKey as Hex);
-  const wallet = createWalletClient({
-    account,
-    chain: polygon,
-    transport: http(rpcUrl),
-  });
-
+  const wallet = createWalletClient({ account, chain: polygon, transport: http() });
   const builderConfig = new BuilderConfig({
-    localBuilderConfig: {
-      apiKey: builderApiKey,
-      secret: builderSecret,
-      passphrase: builderPassphrase,
+    localBuilderCreds: {
+      key: process.env.POLY_BUILDER_API_KEY!,
+      secret: process.env.POLY_BUILDER_SECRET!,
+      passphrase: process.env.POLY_BUILDER_PASSPHRASE!,
     },
   });
-
-  // SIGNATURE_TYPE 0 = MetaMask/EOA → Safe wallet  (RelayerTxType.SAFE)
-  // SIGNATURE_TYPE 1 = Magic/email  → Proxy wallet (RelayerTxType.PROXY)
-  const txType =
-    CONFIG.signatureType === 1 ? RelayerTxType.PROXY : RelayerTxType.SAFE;
-
   _relayClient = new RelayClient(
-    RELAYER_URL,
-    CHAIN_ID,
+    "https://relayer-v2.polymarket.com",
+    137,
     wallet,
-    builderConfig,
-    txType
+    builderConfig as any,
+    CONFIG.signatureType === 1 ? RelayerTxType.PROXY : RelayerTxType.SAFE
   );
-
   return _relayClient;
 }
 
-// ─── Core: build & submit a single redeemPositions transaction ────────────────
+// ─── Core: Settlement & Redemption ───────────────────────────────────────────
 
-function buildRedeemTx(conditionId: string): Transaction {
-  const calldata = encodeFunctionData({
-    abi: CTF_REDEEM_ABI,
-    functionName: "redeemPositions",
-    // indexSets [1, 2] = outcome slot 0 (YES) and slot 1 (NO) in binary markets.
-    // The CTF will simply no-op on whichever slot has no winning tokens.
-    args: [USDC_ADDRESS as Hex, zeroHash, conditionId as Hex, [BigInt(1), BigInt(2)]],
-  });
-
-  return { to: CTF_ADDRESS, data: calldata, value: "0" };
-}
-
-async function submitRedeem(
-  conditionId: string,
-  label: string
-): Promise<boolean> {
-  const client = getRelayClient();
-  const tx = buildRedeemTx(conditionId);
-
-  try {
-    log.info("REDEEM_SUBMITTING", { conditionId, label });
-    const response = await client.execute([tx], `Redeem: ${label}`);
-    const result = await response.wait();
-
-    log.info("REDEEM_CONFIRMED", {
-      conditionId,
-      label,
-      txHash: (result as any)?.transactionHash ?? "unknown",
-    });
-    return true;
-  } catch (err) {
-    log.error("REDEEM_FAILED", {
-      conditionId,
-      label,
-      error: (err as Error).message,
-    });
-    return false;
+async function pollForSettlement(conditionId: string): Promise<boolean> {
+  log.info("REDEEM_POLLING_SETTLEMENT", { conditionId });
+  for (let i = 0; i < 12; i++) { // Poll for ~60 seconds
+    try {
+      const payouts = await publicClient.readContract({
+        address: CTF_ADDRESS,
+        abi: CTF_ABI,
+        functionName: "payoutNumerators",
+        args: [conditionId as Hex],
+      }) as any;
+      if (payouts.some((p: any) => p > 0n)) return true;
+    } catch (e) { /* ignore network blips */ }
+    await new Promise(r => setTimeout(r, 5000));
   }
+  return false;
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
-
-/**
- * Call this immediately after a RESOLUTION_WIN in trader.ts.
- * The conditionId comes from market.conditionId that your scanner already fetches.
- */
-export async function redeemAfterWin(
-  conditionId: string,
-  marketQuestion: string
-): Promise<void> {
-  if (CONFIG.shadowMode) {
-    log.info("REDEEM_SKIPPED_SHADOW", { conditionId, marketQuestion });
-    return;
-  }
-
-  await submitRedeem(conditionId, marketQuestion);
-}
-
-/**
- * Call once on startup (after shadowMode check).
- * Queries the Polymarket Data API for any positions that are marked redeemable
- * — these are positions from previous sessions that were won but never claimed.
- * Redeems them all so their USDC becomes available immediately.
- */
-export async function sweepUnredeemedPositions(): Promise<void> {
+export async function redeemAfterWin(market: Market): Promise<void> {
   if (CONFIG.shadowMode) return;
 
-  const proxyAddress = CONFIG.polymarketFunderAddress;
+  const settled = await pollForSettlement(market.conditionId);
+  if (!settled) {
+    log.error("REDEEM_FAILED_SETTLEMENT_TIMEOUT", { market: market.question });
+    return;
+  }
 
-  let positions: RedeemablePosition[] = [];
+  const walletAddress = CONFIG.polymarketFunderAddress as Hex;
+  
+  // Verify which token we actually hold to build indexSets
+  const [yesBal, noBal] = await Promise.all([
+    publicClient.readContract({ address: CTF_ADDRESS, abi: CTF_ABI, functionName: "balanceOf", args: [walletAddress, BigInt(market.yesTokenId)] }),
+    publicClient.readContract({ address: CTF_ADDRESS, abi: CTF_ABI, functionName: "balanceOf", args: [walletAddress, BigInt(market.noTokenId)] })
+  ]);
+
+  const indexSets: bigint[] = [];
+  if ((yesBal as any) > 0n) indexSets.push(1n);
+  if ((noBal as any) > 0n) indexSets.push(2n);
+
+  if (indexSets.length === 0) {
+    log.warn("REDEEM_SKIPPED_NO_BALANCE", { market: market.question });
+    return;
+  }
+
+  const tx: Transaction = market.negRisk 
+    ? {
+        to: NEG_RISK_ADAPTER,
+        data: encodeFunctionData({
+          abi: NEG_RISK_ABI,
+          functionName: "redeemPositions",
+          args: [CTF_ADDRESS, USDC_ADDRESS, zeroHash, market.conditionId as Hex, indexSets]
+        }),
+        value: "0"
+      }
+    : {
+        to: CTF_ADDRESS,
+        data: encodeFunctionData({
+          abi: CTF_ABI,
+          functionName: "redeemPositions",
+          args: [USDC_ADDRESS, zeroHash, market.conditionId as Hex, indexSets]
+        }),
+        value: "0"
+      };
+
   try {
-    const url =
-      `${DATA_API}/positions?user=${proxyAddress}&redeemable=true&sizeThreshold=0.01&limit=500`;
-    const res = await fetch(url);
-    if (!res.ok) {
-      log.warn("REDEEM_SWEEP_FETCH_ERROR", {
-        status: res.status,
-        url,
-      });
-      return;
-    }
-    const raw = (await res.json()) as Array<{
-      conditionId: string;
-      outcomeIndex: number;
-      size: number;
-      title: string;
-    }>;
-    positions = raw.map((p) => ({
-      conditionId: p.conditionId,
-      outcomeIndex: p.outcomeIndex,
-      size: p.size,
-      title: p.title ?? p.conditionId,
-    }));
+    const response = await getRelayClient().execute([tx], `Redeem: ${market.question}`);
+    const receipt = await response.wait();
+    log.info("REDEEM_CONFIRMED", { txHash: (receipt as any).transactionHash, market: market.question });
   } catch (err) {
-    log.error("REDEEM_SWEEP_ERROR", { error: (err as Error).message });
-    return;
+    log.error("REDEEM_ERROR", { market: market.question, error: (err as Error).message });
   }
-
-  if (positions.length === 0) {
-    log.info("REDEEM_SWEEP_NONE", { message: "No unredeemed positions found." });
-    return;
-  }
-
-  log.info("REDEEM_SWEEP_START", {
-    count: positions.length,
-    positions: positions.map((p) => ({
-      conditionId: p.conditionId,
-      title: p.title,
-      size: p.size,
-    })),
-  });
-
-  // Group by conditionId in case the API returns multiple outcome rows per market
-  const byCondition = new Map<string, RedeemablePosition>();
-  for (const p of positions) {
-    if (!byCondition.has(p.conditionId)) byCondition.set(p.conditionId, p);
-  }
-
-  let redeemed = 0;
-  let failed = 0;
-
-  for (const [conditionId, pos] of byCondition) {
-    const ok = await submitRedeem(conditionId, pos.title);
-    if (ok) redeemed++;
-    else failed++;
-
-    // Brief pause between transactions to avoid nonce collisions
-    if (byCondition.size > 1) {
-      await new Promise((r) => setTimeout(r, 2000));
-    }
-  }
-
-  log.info("REDEEM_SWEEP_DONE", { redeemed, failed, total: byCondition.size });
 }
