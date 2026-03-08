@@ -35,10 +35,13 @@ export type LogEvent =
   | "REDEEM_UNCAUGHT"
   // Redemption lifecycle → trades/system/errors log
   | "REDEEM_POLLING_SETTLEMENT"
+  | "REDEEM_SETTLEMENT_CONFIRMED_ONCHAIN"
   | "REDEEM_FAILED_SETTLEMENT_TIMEOUT"
   | "REDEEM_SKIPPED_NO_BALANCE"
   | "REDEEM_CONFIRMED"
   | "REDEEM_ERROR"
+  | "REDEEM_RPC_INITIAL_ERROR"
+  | "REDEEM_RPC_POLLING_RETRY"
   // Shadow mode → trades log
   | "SHADOW_BET_SIMULATED"
   | "SHADOW_RESOLUTION_WIN"
@@ -88,6 +91,7 @@ const SYSTEM_EVENTS = new Set<LogEvent>([
   "BOT_STARTED", "BOT_PAUSED", "BOT_RESUMED", "CONFIG_UPDATED",
   "RESOLUTION_POLLING",
   "REDEEM_POLLING_SETTLEMENT",
+  "REDEEM_SETTLEMENT_CONFIRMED_ONCHAIN",
   "INFO",
 ]);
 
@@ -100,6 +104,7 @@ const CONSOLE_EVENTS = new Set<LogEvent>([
   "SLOT_PROFIT_EXTRACTED",
   "ORDER_FAILED", "RESOLUTION_ERROR", "SCAN_ERROR",
   "REDEEM_CONFIRMED", "REDEEM_FAILED_SETTLEMENT_TIMEOUT", "REDEEM_ERROR",
+  "REDEEM_RPC_INITIAL_ERROR",
 ]);
 
 // ─── file paths ───────────────────────────────────────────────────────────────
@@ -171,21 +176,21 @@ function write(level: LogLevel, event: LogEvent, data: Record<string, unknown>):
 
 function buildSummary(event: LogEvent, data: Record<string, unknown>): string {
   const parts: string[] = [];
-  if (data["asset"])                    parts.push(String(data["asset"]));
-  if (data["duration"])                 parts.push(String(data["duration"]));
-  if (data["slotId"] !== undefined)     parts.push(`slot=${data["slotId"]}`);
-  if (data["stakeUsd"] !== undefined)   parts.push(`$${data["stakeUsd"]}`);
-  if (data["priceAtBet"] !== undefined) parts.push(`@${data["priceAtBet"]}`);
-  if (data["side"])                     parts.push(`${data["side"]}`);
-  if (data["winSide"])                  parts.push(`${data["winSide"]}`);
-  if (data["payoutUsd"] !== undefined)  parts.push(`payout=$${data["payoutUsd"]}`);
-  if (data["profitUsd"] !== undefined)  parts.push(`profit=$${data["profitUsd"]}`);
+  if (data["asset"])                        parts.push(String(data["asset"]));
+  if (data["duration"])                     parts.push(String(data["duration"]));
+  if (data["slotId"] !== undefined)         parts.push(`slot=${data["slotId"]}`);
+  if (data["stakeUsd"] !== undefined)       parts.push(`$${data["stakeUsd"]}`);
+  if (data["priceAtBet"] !== undefined)     parts.push(`@${data["priceAtBet"]}`);
+  if (data["side"])                         parts.push(`${data["side"]}`);
+  if (data["winSide"])                      parts.push(`${data["winSide"]}`);
+  if (data["payoutUsd"] !== undefined)      parts.push(`payout=$${data["payoutUsd"]}`);
+  if (data["profitUsd"] !== undefined)      parts.push(`profit=$${data["profitUsd"]}`);
   if (data["profitExtracted"] !== undefined) parts.push(`extracted=$${data["profitExtracted"]}`);
-  if (data["txHash"])                   parts.push(`tx=${data["txHash"]}`);
-  if (data["market"])                   parts.push(`market=${data["market"]}`);
-  if (data["conditionId"])              parts.push(`condition=${data["conditionId"]}`);
-  if (data["error"])                    parts.push(`ERR: ${data["error"]}`);
-  if (data["updatedKeys"])              parts.push(`keys=${JSON.stringify(data["updatedKeys"])}`);
+  if (data["txHash"])                       parts.push(`tx=${data["txHash"]}`);
+  if (data["market"])                       parts.push(`market=${data["market"]}`);
+  if (data["conditionId"])                  parts.push(`condition=${data["conditionId"]}`);
+  if (data["error"])                        parts.push(`ERR: ${data["error"]}`);
+  if (data["updatedKeys"])                  parts.push(`keys=${JSON.stringify(data["updatedKeys"])}`);
   if (data["message"] && parts.length === 0) parts.push(String(data["message"]));
   return parts.length > 0 ? `  ${parts.join("  ")}` : "";
 }

@@ -41,10 +41,24 @@ import type { ApiKeyCreds } from "@polymarket/clob-client";
 import { CONFIG } from "./config.js";
 import { log } from "./logger.js";
 import type { Market, OrderResult, MarketResolution } from "./types.js";
+import { createPublicClient, Hex, http } from "viem";
+import { polygon } from "viem/chains";
 
 const GAMMA_API = "https://gamma-api.polymarket.com";
 const CLOB_HOST = "https://clob.polymarket.com";
 const POLYGON_CHAIN_ID = 137;
+
+const CTF_ABI = [
+  { name: "payoutNumerators", type: "function", inputs: [{ name: "conditionId", type: "bytes32" }, { name: "index", type: "uint256" }], outputs: [{ type: "uint256" }] },
+  { name: "payoutDenominator", type: "function", inputs: [{ name: "conditionId", type: "bytes32" }], outputs: [{ type: "uint256" }] },
+] as const;
+
+const CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+
+const publicClient = createPublicClient({ 
+  chain: polygon, 
+  transport: http(CONFIG.polygonRpcUrl) 
+});
 
 const ASSET_SLUG_MAP: Record<string, string> = {
   BTC: "btc", ETH: "eth", SOL: "sol",
@@ -325,22 +339,53 @@ export async function fetchMarketResolution(
 ): Promise<MarketResolution> {
   try {
     const market = await fetchMarketById(marketId);
-    if (!market || !market.closed) return { marketId, outcome: "PENDING" };
+    if (!market || !market.conditionId) return { marketId, outcome: "PENDING" };
 
-    let prices: number[] = [];
-    try {
-      prices = (JSON.parse(market.outcomePrices ?? "[]") as (string | number)[]).map(Number);
-    } catch {
+    // 1. Check if the contract is actually settled
+    const denominator = await publicClient.readContract({
+      address: CTF_ADDRESS,
+      abi: CTF_ABI,
+      functionName: "payoutDenominator",
+      args: [market.conditionId as Hex],
+    }) as bigint;
+
+    // If denominator is 0, the Oracle hasn't reported yet. 
+    // Even if the API says "closed", we stay in PENDING.
+    if (denominator === 0n) {
       return { marketId, outcome: "PENDING" };
     }
-    if (prices.length < 2) return { marketId, outcome: "PENDING" };
+
+    // 2. Determine the winner on-chain
+    // Index 0 is YES, Index 1 is NO
+    const [payoutYes, payoutNo] = await Promise.all([
+      publicClient.readContract({
+        address: CTF_ADDRESS,
+        abi: CTF_ABI,
+        functionName: "payoutNumerators",
+        args: [market.conditionId as Hex, 0n],
+      }) as Promise<bigint>,
+      publicClient.readContract({
+        address: CTF_ADDRESS,
+        abi: CTF_ABI,
+        functionName: "payoutNumerators",
+        args: [market.conditionId as Hex, 1n],
+      }) as Promise<bigint>,
+    ]);
 
     let outcome: "YES" | "NO" | "CANCELLED";
-    if (prices[0] >= 0.99) outcome = "YES";
-    else if (prices[1] >= 0.99) outcome = "NO";
-    else outcome = "CANCELLED";
+    
+    if (payoutYes > 0n && payoutNo === 0n) outcome = "YES";
+    else if (payoutNo > 0n && payoutYes === 0n) outcome = "NO";
+    else outcome = "CANCELLED"; // Covers [1, 1] or [0.5, 0.5] cases
 
-    return { marketId, outcome, resolvedAt: new Date().toISOString() };
+    console.info("RESOLUTION_CONFIRMED_ONCHAIN", { marketId, outcome });
+
+    return { 
+      marketId, 
+      outcome, 
+      resolvedAt: new Date().toISOString() 
+    };
+
   } catch (err) {
     log.error("RESOLUTION_ERROR", { marketId, error: (err as Error).message });
     return { marketId, outcome: "PENDING" };

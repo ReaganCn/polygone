@@ -17,7 +17,8 @@ const USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 // ─── ABIs ───────────────────────────────────────────────────────────────────
 const CTF_ABI = [
   { name: "redeemPositions", type: "function", inputs: [{ name: "collateralToken", type: "address" }, { name: "parentCollectionId", type: "bytes32" }, { name: "conditionId", type: "bytes32" }, { name: "indexSets", type: "uint256[]" }] },
-  { name: "payoutNumerators", type: "function", inputs: [{ name: "conditionId", type: "bytes32" }], outputs: [{ type: "uint256[]" }] },
+  { name: "payoutNumerators", type: "function", inputs: [{ name: "conditionId", type: "bytes32" }, { name: "index", type: "uint256" }], outputs: [{ type: "uint256" }] },
+  { name: "payoutDenominator", type: "function", inputs: [{ name: "conditionId", type: "bytes32" }], outputs: [{ type: "uint256" }] },
   { name: "balanceOf", type: "function", inputs: [{ name: "account", type: "address" }, { name: "id", type: "uint256" }], outputs: [{ type: "uint256" }] }
 ] as const;
 
@@ -27,7 +28,7 @@ const NEG_RISK_ABI = [
 
 const publicClient = createPublicClient({ 
   chain: polygon, 
-  transport: http(process.env.POLYGON_RPC_URL ?? "https://polygon-rpc.com") 
+  transport: http(CONFIG.polygonRpcUrl) 
 });
 
 // ─── Helper: Get Relayer Client ──────────────────────────────────────────────
@@ -55,19 +56,33 @@ function getRelayClient(): RelayClient {
 
 // ─── Core: Settlement & Redemption ───────────────────────────────────────────
 
+// Inside redeemer.ts -> pollForSettlement
+// Inside redeemer.ts -> pollForSettlement
 async function pollForSettlement(conditionId: string): Promise<boolean> {
   log.info("REDEEM_POLLING_SETTLEMENT", { conditionId });
-  for (let i = 0; i < 12; i++) { // Poll for ~60 seconds
+  
+  for (let i = 0; i < 120; i++) { 
     try {
-      const payouts = await publicClient.readContract({
+      const denominator = await publicClient.readContract({
         address: CTF_ADDRESS,
         abi: CTF_ABI,
-        functionName: "payoutNumerators",
+        functionName: "payoutDenominator",
         args: [conditionId as Hex],
-      }) as any;
-      if (payouts.some((p: any) => p > 0n)) return true;
-    } catch (e) { /* ignore network blips */ }
-    await new Promise(r => setTimeout(r, 5000));
+      }) as bigint;
+      
+      if (denominator > 0n) {
+        log.info("REDEEM_SETTLEMENT_CONFIRMED_ONCHAIN", { conditionId });
+        return true;
+      }
+    } catch (e: any) { 
+      // Print the exact error on the very first try so we know if it's an ABI/RPC issue
+      if (i === 0) {
+        log.error("REDEEM_RPC_INITIAL_ERROR", { conditionId, error: e.message });
+      } else if (i % 10 === 0) {
+        log.warn("REDEEM_RPC_POLLING_RETRY", { conditionId });
+      }
+    }
+    await new Promise(r => setTimeout(r, 10000));
   }
   return false;
 }
@@ -122,6 +137,7 @@ export async function redeemAfterWin(market: Market): Promise<void> {
     const response = await getRelayClient().execute([tx], `Redeem: ${market.question}`);
     const receipt = await response.wait();
     log.info("REDEEM_CONFIRMED", { txHash: (receipt as any).transactionHash, market: market.question });
+    console.info("REDEEM_CONFIRMED", { txHash: (receipt as any).transactionHash, market: market.question });
   } catch (err) {
     log.error("REDEEM_ERROR", { market: market.question, error: (err as Error).message });
   }
