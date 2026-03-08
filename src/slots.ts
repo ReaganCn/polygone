@@ -17,7 +17,7 @@ import { CONFIG } from "./config.js";
 import { log } from "./logger.js";
 import type { ActiveBet, BetRule } from "./types.js";
 
-export type SlotStatus = "idle" | "active";
+export type SlotStatus = "idle" | "pending" | "active";
 
 export interface RuleStats {
   wins: number;
@@ -158,6 +158,25 @@ export function getSummary() {
 }
 
 // ─── mutations ────────────────────────────────────────────────────────────────
+
+/**
+ * Synchronously marks a slot as "pending" so no other caller can grab it
+ * while an async order is in flight. Must be called immediately after
+ * getIdleSlot(), before any await.
+ */
+export function reserveSlot(slotId: number): void {
+  const slot = findSlot(slotId);
+  slot.status = "pending";
+}
+
+/**
+ * Returns a "pending" slot back to "idle" when an order fails before
+ * assignBet() is reached (e.g. FOK rejection, balance check failure).
+ */
+export function releaseSlot(slotId: number): void {
+  const slot = findSlot(slotId);
+  slot.status = "idle";
+}
 
 export function assignBet(slotId: number, bet: ActiveBet): void {
   const slot = findSlot(slotId);

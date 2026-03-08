@@ -10,10 +10,10 @@
 import { CONFIG } from "./config.js";
 import { log } from "./logger.js";
 import { placeOrder, fetchMarketResolution } from "./polymarket.js";
-import { getIdleSlot, assignBet, recordWin, recordLoss } from "./slots.js";
+import { getIdleSlot, reserveSlot, releaseSlot, assignBet, recordWin, recordLoss } from "./slots.js";
 import { trackMarket, untrackMarket } from "./scanner.js";
 import { simulateBet } from "./shadow.js";
-import { redeemAfterWin } from "./redeemer.js"; // ← NEW
+import { redeemAfterWin } from "./redeemer.js";
 import type { Market, ActiveBet, BetRule } from "./types.js";
 
 const activeBetsByMarketId = new Map<string, ActiveBet>();
@@ -37,7 +37,9 @@ export async function handleQualifyingMarket(market: Market, rule: BetRule): Pro
     return;
   }
 
-  trackMarket(market.id);
+  // Reserve the slot synchronously before any await so no concurrent
+  // call can grab the same slot while the order is in flight.
+  reserveSlot(slot.id);
 
   log.info("BET_QUEUED", {
     slotId: slot.id,
@@ -90,7 +92,7 @@ export function handleWsResolution(
 
     recordWin(bet.slotId, payoutUsd);
 
-    // ── NEW: trigger redemption so USDC becomes spendable immediately ─────────
+    // ── trigger redemption so USDC becomes spendable immediately ─────────────
     // Fire-and-forget — we don't await because the slot can already start
     // tracking the next bet. Redemption confirmation is logged by redeemer.ts.
     if (!bet.shadow) {
@@ -138,6 +140,7 @@ async function handleLiveBet(
 
   if (!result.success) {
     log.error("ORDER_FAILED", { slotId, marketId: market.id, error: result.error, rule });
+    releaseSlot(slotId);
     untrackMarket(market.id);
     return;
   }

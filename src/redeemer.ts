@@ -6,27 +6,6 @@
  *   spendable USDC. Instead, you hold ERC-1155 conditional tokens (the winning
  *   outcome tokens) that must be explicitly redeemed by calling redeemPositions()
  *   on Polymarket's Conditional Token Framework (CTF) contract.
- *
- *   Because every Polymarket account's positions are held inside a Safe (Gnosis
- *   proxy multisig), you cannot call redeemPositions() directly with your EOA.
- *   The Safe must execute the call via execTransaction, which requires the
- *   builder-relayer-client to construct and sign correctly.
- *
- * How it works:
- *   1. After a WIN resolution in trader.ts, redeemAfterWin(conditionId) is called.
- *   2. On bot startup, sweepUnredeemedPositions() is called to catch any
- *      positions that were won in previous sessions but never claimed.
- *   3. Both paths build a redeemPositions tx, submit it via the relayer, and
- *      wait for on-chain confirmation.
- *
- * New env vars required (add to .env):
- *   POLY_BUILDER_API_KEY=...       (from polymarket.com/settings?tab=builder)
- *   POLY_BUILDER_SECRET=...
- *   POLY_BUILDER_PASSPHRASE=...
- *   POLYGON_RPC_URL=https://polygon-rpc.com   (or your own RPC)
- *
- * New dependency:
- *   npm install @polymarket/builder-relayer-client @polymarket/builder-signing-sdk viem
  */
 
 import {

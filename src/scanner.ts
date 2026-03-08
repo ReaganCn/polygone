@@ -99,6 +99,7 @@ export function stopScanner(): void {
 }
 
 export function isPausedState(): boolean { return isPaused; }
+
 export function trackMarket(id: string): void { trackedMarketIds.add(id); }
 export function untrackMarket(id: string): void { trackedMarketIds.delete(id); }
 
@@ -284,6 +285,13 @@ function evaluateAndFire(market: Market, price: number, source: string): void {
 
   const rule = getMatchingRule(market, price);
   if (!rule) return;
+
+  // Mark the market as tracked synchronously before firing the callback.
+  // The callback is async and yields on its first await, so without this
+  // a second evaluateAndFire for the same market (same heartbeat pass or
+  // a concurrent WS price update) would pass the trackedMarketIds check
+  // above and fire a duplicate bet.
+  trackedMarketIds.add(market.id);
 
   log.info("MARKET_FOUND", {
     source,

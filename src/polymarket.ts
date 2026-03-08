@@ -412,8 +412,9 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
 
     const errorMsg = r["errorMsg"] ?? r["error"];
     const status = r["status"] as string | undefined;
+    const orderId = (r["orderId"] ?? r["id"] ?? r["orderID"] ?? "") as string;
     const isRejected =
-      (typeof errorMsg === "string" && errorMsg.length > 0) ||
+      (typeof errorMsg === "string" && errorMsg.length > 0 && !orderId) ||
       status === "rejected" ||
       status === "error";
 
@@ -428,8 +429,7 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
       });
       return { success: false, error: errorText };
     }
-
-    const orderId = (r["orderId"] ?? r["id"] ?? r["orderID"] ?? "") as string;
+    
 
     log.info("ORDER_RESPONSE", {
       marketId: market.id,
