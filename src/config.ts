@@ -14,6 +14,10 @@
  *   Added builder program credentials: polyBuilderApiKey, polyBuilderSecret,
  *   polyBuilderPassphrase, polygonRpcUrl.
  *   These are read from env but NOT exposed via POST /config (non-mutable).
+ *
+ * CHANGE (scheduler):
+ *   Added tradingStartTime, tradingEndTime ("HH:MM" UTC format).
+ *   Added dailyProfitTarget, dailyLossLimit (USDC, null = disabled).
  */
 
 import "dotenv/config";
@@ -68,11 +72,9 @@ export interface BotConfig {
   polyPassphrase: string;
 
   // ── Builder program credentials (required for auto-redemption) ─────────────
-  // Generate at: polymarket.com/settings?tab=builder
   polyBuilderApiKey: string;
   polyBuilderSecret: string;
   polyBuilderPassphrase: string;
-  // RPC endpoint for Polygon — any public or private node works
   polygonRpcUrl: string;
   // ──────────────────────────────────────────────────────────────────────────
 
@@ -120,6 +122,19 @@ export interface BotConfig {
 
   // Express API port
   apiPort: number;
+
+  // ── Scheduler ─────────────────────────────────────────────────────────────
+  // Trading hours in UTC. Format: "HH:MM". Bot pauses outside this window.
+  // Defaults to all day ("00:00" – "23:59").
+  tradingStartTime: string;
+  tradingEndTime: string;
+
+  // Daily P&L thresholds in USDC. null = disabled.
+  //   dailyProfitTarget: pause when today's net P&L >= this value.
+  //   dailyLossLimit:    pause when today's net P&L <= -this value (stored positive).
+  dailyProfitTarget: number | null;
+  dailyLossLimit: number | null;
+  // ──────────────────────────────────────────────────────────────────────────
 }
 
 function loadConfig(): BotConfig {
@@ -137,8 +152,6 @@ function loadConfig(): BotConfig {
     polySecret: optionalEnv("POLY_SECRET", ""),
     polyPassphrase: optionalEnv("POLY_PASSPHRASE", ""),
 
-    // Builder credentials — optionalEnv so the bot still boots in shadow mode
-    // without them. redeemer.ts will throw clearly at runtime if live mode needs them.
     polyBuilderApiKey:     optionalEnv("POLY_BUILDER_API_KEY", ""),
     polyBuilderSecret:     optionalEnv("POLY_BUILDER_SECRET", ""),
     polyBuilderPassphrase: optionalEnv("POLY_BUILDER_PASSPHRASE", ""),
@@ -166,15 +179,23 @@ function loadConfig(): BotConfig {
 
     orderType: orderTypeRaw as OrderTypeOption,
 
-    numSlots:            parseInt_("NUM_SLOTS", 5),
-    slotInitialUsd:      parseFloat_("SLOT_INITIAL_USD", 1),
+    numSlots:             parseInt_("NUM_SLOTS", 5),
+    slotInitialUsd:       parseFloat_("SLOT_INITIAL_USD", 1),
     slotProfitMultiplier: parseFloat_("SLOT_PROFIT_MULTIPLIER", 1.2),
 
     shadowMode: parseBool("SHADOW_MODE", true),
 
-    logFilePath: optionalEnv("LOG_FILE_PATH", "./logs/activity.log"),
+    logFilePath:              optionalEnv("LOG_FILE_PATH", "./logs/activity.log"),
     resolutionPollIntervalMs: parseInt_("RESOLUTION_POLL_INTERVAL_MS", 5000),
-    apiPort: parseInt_("API_PORT", 3000),
+    apiPort:                  parseInt_("API_PORT", 3000),
+
+    tradingStartTime: optionalEnv("TRADING_START_TIME", "00:00"),
+    tradingEndTime:   optionalEnv("TRADING_END_TIME",   "23:59"),
+
+    dailyProfitTarget: process.env["DAILY_PROFIT_TARGET"]
+      ? parseFloat_("DAILY_PROFIT_TARGET", 0) : null,
+    dailyLossLimit: process.env["DAILY_LOSS_LIMIT"]
+      ? parseFloat_("DAILY_LOSS_LIMIT", 0) : null,
   };
 }
 
@@ -200,29 +221,37 @@ export type MutableConfigKeys =
   | "slotInitialUsd"
   | "slotProfitMultiplier"
   | "shadowMode"
-  | "targetAssets";
+  | "targetAssets"
+  | "tradingStartTime"
+  | "tradingEndTime"
+  | "dailyProfitTarget"
+  | "dailyLossLimit";
 
-const KEY_TYPES: Record<MutableConfigKeys, "number" | "integer" | "boolean" | "string" | "stringArray" | "orderType"> = {
-  scanIntervalMs:         "integer",
-  enable5m:               "boolean",
-  enable15m:              "boolean",
-  enableFallback:         "boolean",
-  priceRangeMin5m:        "number",
-  priceRangeMax5m:        "number",
-  priceRangeMin15m:       "number",
-  priceRangeMax15m:       "number",
-  maxTimeRemaining5m:     "integer",
-  maxTimeRemaining15m:    "integer",
+const KEY_TYPES: Record<MutableConfigKeys, "number" | "integer" | "boolean" | "string" | "stringArray" | "orderType" | "numberOrNull"> = {
+  scanIntervalMs:           "integer",
+  enable5m:                 "boolean",
+  enable15m:                "boolean",
+  enableFallback:           "boolean",
+  priceRangeMin5m:          "number",
+  priceRangeMax5m:          "number",
+  priceRangeMin15m:         "number",
+  priceRangeMax15m:         "number",
+  maxTimeRemaining5m:       "integer",
+  maxTimeRemaining15m:      "integer",
   fallbackTimeRemaining5m:  "integer",
   fallbackTimeRemaining15m: "integer",
   fallbackMinPrice:         "number",
   fallbackMaxPrice:         "number",
-  orderType:              "orderType",
-  numSlots:               "integer",
-  slotInitialUsd:         "number",
-  slotProfitMultiplier:   "number",
-  shadowMode:             "boolean",
-  targetAssets:           "stringArray",
+  orderType:                "orderType",
+  numSlots:                 "integer",
+  slotInitialUsd:           "number",
+  slotProfitMultiplier:     "number",
+  shadowMode:               "boolean",
+  targetAssets:             "stringArray",
+  tradingStartTime:         "string",
+  tradingEndTime:           "string",
+  dailyProfitTarget:        "numberOrNull",
+  dailyLossLimit:           "numberOrNull",
 };
 
 export const CONFIG: BotConfig = loadConfig();
@@ -274,6 +303,13 @@ export function updateConfig(
           } else {
             throw new Error("must be an array or comma-separated string");
           }
+          break;
+        }
+        case "numberOrNull": {
+          if (raw === null || raw === "" || raw === "null") { coerced = null; break; }
+          const n = Number(raw);
+          if (isNaN(n)) throw new Error("must be a number or null");
+          coerced = n;
           break;
         }
         default:

@@ -9,6 +9,10 @@
  *   POST /pause / /resume          Pause/resume new bets
  *   GET  /logs?tail=N&cat=...      Last N log lines
  *   GET  /logs/files               List all log files
+ *
+ * CHANGE (scheduler):
+ *   /status now includes a `scheduler` block with trading window,
+ *   today's net P&L, and the configured daily thresholds.
  */
 
 import express, { Request, Response } from "express";
@@ -16,6 +20,7 @@ import { CONFIG, updateConfig } from "./config.js";
 import { log } from "./logger.js";
 import { getSnapshot, getActiveBets, getSummary } from "./slots.js";
 import { pauseScanner, resumeScanner, isPausedState } from "./scanner.js";
+import { dailyState } from "./dailyState.js";
 import type { MutableConfigKeys } from "./config.js";
 
 export function startApiServer(): void {
@@ -27,16 +32,10 @@ export function startApiServer(): void {
     const snapshot = getSnapshot();
     const summary  = getSummary();
 
-    // Net P&L:
-    //   netPnl = profitExtracted (banked wins) - totalLost (stakes destroyed by losses)
-    //          + unrealisedGain (win profit sitting in slots above initial seeding)
-    //
-    // Note: unrealisedGain only counts profit above initial — if slots are at their
-    // starting balance, unrealisedGain = 0. It does NOT include compounded gains
-    // that haven't been extracted yet above threshold (those appear in currentBalance).
-    const initialCapital  = round2(CONFIG.numSlots * CONFIG.slotInitialUsd);
-    const unrealisedGain  = round2(Math.max(0, summary.totalBalance - initialCapital));
-    const netPnl          = round2(summary.totalProfitExtracted - summary.totalLost + unrealisedGain);
+    const initialCapital = round2(CONFIG.numSlots * CONFIG.slotInitialUsd);
+    const unrealisedGain = round2(Math.max(0, summary.totalBalance - initialCapital));
+    const netPnl         = round2(summary.totalProfitExtracted - summary.totalLost + unrealisedGain);
+    const netPnlToday    = round2(netPnl - dailyState.startOfDayPnl);
 
     const activeBets = getActiveBets().map((b) => ({
       betId: b.betId,
@@ -86,6 +85,16 @@ export function startApiServer(): void {
         byRule: summary.byRule,
       },
 
+      scheduler: {
+        tradingWindow: {
+          start: CONFIG.tradingStartTime,
+          end:   CONFIG.tradingEndTime,
+        },
+        dailyNetPnl:       netPnlToday,
+        dailyProfitTarget: CONFIG.dailyProfitTarget,
+        dailyLossLimit:    CONFIG.dailyLossLimit,
+      },
+
       slots: snapshot,
       activeBets,
     });
@@ -123,17 +132,21 @@ export function startApiServer(): void {
           "priceRangeMin5m", "priceRangeMax5m",
           "priceRangeMin15m", "priceRangeMax15m",
           "maxTimeRemaining5m", "maxTimeRemaining15m",
-          "fallbackTimeRemainingS", "fallbackMaxPrice",
+          "fallbackTimeRemaining5m", "fallbackTimeRemaining15m",
+          "fallbackMinPrice", "fallbackMaxPrice",
           "orderType",
           "numSlots", "slotInitialUsd", "slotProfitMultiplier",
           "shadowMode", "targetAssets",
+          "tradingStartTime", "tradingEndTime",
+          "dailyProfitTarget", "dailyLossLimit",
         ],
         examples: {
-          "disable 5m markets":           { enable5m: false },
-          "only use fallback":            { enable5m: false, enable15m: false, enableFallback: true },
-          "set 15m price range":          { priceRangeMin15m: 0.96, priceRangeMax15m: 0.99 },
-          "set max time remaining (5m)":  { maxTimeRemaining5m: 120 },
-          "set max time remaining (15m)": { maxTimeRemaining15m: 300 },
+          "set trading hours":         { tradingStartTime: "09:00", tradingEndTime: "17:00" },
+          "set daily profit target":   { dailyProfitTarget: 50 },
+          "set daily loss limit":      { dailyLossLimit: 20 },
+          "disable daily profit cap":  { dailyProfitTarget: null },
+          "disable 5m markets":        { enable5m: false },
+          "set 15m price range":       { priceRangeMin15m: 0.96, priceRangeMax15m: 0.99 },
         },
       });
       return;
