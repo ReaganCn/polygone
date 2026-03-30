@@ -21,7 +21,7 @@
 import express, { Request, Response } from "express";
 import { CONFIG, updateConfig } from "./config.js";
 import { log } from "./logger.js";
-import { getSnapshot, getActiveBets, getSummary, getSeededCapital } from "./slots.js";
+import { getSnapshot, getActiveBets, getSummary, getSeededCapital, resetAllSlots } from "./slots.js";
 import { pauseScanner, resumeScanner, isPausedState } from "./scanner.js";
 import type { MutableConfigKeys } from "./config.js";
 
@@ -302,6 +302,21 @@ export function startApiServer(): void {
     res.json({ success: true, message: "Resumed." });
   });
 
+  // ── POST /reset-slots ─────────────────────────────────────────────────────────
+  app.post("/reset-slots", (_req: Request, res: Response) => {
+    const resetCount = resetAllSlots();
+    log.info("INFO", {
+      message: `Manual slot reset: ${resetCount} idle slot(s) reset to $${CONFIG.slotInitialUsd}.`,
+      resetCount,
+      slotInitialUsd: CONFIG.slotInitialUsd,
+    });
+    res.json({
+      success: true,
+      resetCount,
+      message: `Reset ${resetCount} idle slot(s) to $${CONFIG.slotInitialUsd}. Active slots were skipped.`,
+    });
+  });
+
   // ── GET /logs ─────────────────────────────────────────────────────────────────
   app.get("/logs", (req: Request, res: Response) => {
     const n = parseInt((req.query["tail"] as string) ?? "100", 10);
@@ -331,6 +346,7 @@ export function startApiServer(): void {
         "POST /config",
         "POST /pause",
         "POST /resume",
+        "POST /reset-slots",
         "GET  /logs?tail=N&cat=trades|errors|system",
         "GET  /logs/files",
       ],

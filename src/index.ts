@@ -18,6 +18,9 @@ import { initialiseClobClient } from "./polymarket.js";
 import { startScanner, stopScanner } from "./scanner.js";
 import { startApiServer } from "./api.js";
 import { handleQualifyingMarket, handleWsResolution } from "./trader.js";
+import { sweepUnredeemedPositions } from "./redeemer.js";
+import { getSummary, resetAllSlots } from "./slots.js";
+import { notifyDailySummary } from "./telegram.js";
 
 async function main(): Promise<void> {
   log.info("BOT_STARTED", {
@@ -60,10 +63,13 @@ async function main(): Promise<void> {
     }
   }
 
-  // 3. Start control panel
+  // 3. Sweep any unredeemed winning positions from previous sessions
+  await sweepUnredeemedPositions();
+
+  // 4. Start control panel
   startApiServer();
 
-  // 4. Start WebSocket-driven scanner
+  // 5. Start WebSocket-driven scanner
   await startScanner(handleQualifyingMarket, handleWsResolution);
 
   log.info("BOT_STARTED", {
@@ -71,6 +77,13 @@ async function main(): Promise<void> {
     controlPanel: `http://127.0.0.1:${CONFIG.apiPort}`,
     note: "Price updates arrive via WebSocket. Heartbeat HTTP fetch keeps market list fresh.",
   });
+
+  // 6. Schedule daily slot reset + Telegram summary at midnight UTC
+  scheduleDailyReset();
+
+  // 7. Purge logs older than 24 h — run immediately then every hour
+  log.cleanup();
+  setInterval(() => log.cleanup(), 60 * 60 * 1000).unref();
 }
 
 // ─── graceful shutdown ────────────────────────────────────────────────────────
@@ -82,6 +95,59 @@ function shutdown(signal: string): void {
     log.info("INFO", { message: "Shutdown complete." });
     process.exit(0);
   }, 3000);
+}
+
+// ─── daily reset ─────────────────────────────────────────────────────────────
+
+function runDailyReset(): void {
+  const summary = getSummary();
+  notifyDailySummary({
+    totalTrades:          summary.totalTrades,
+    totalWins:            summary.totalWins,
+    totalLosses:          summary.totalLosses,
+    totalStopLosses:      summary.totalStopLosses,
+    winRate:              summary.winRate,
+    netPnl:               Math.round((summary.totalProfitExtracted - summary.totalLost) * 100) / 100,
+    totalProfitExtracted: summary.totalProfitExtracted,
+    totalLost:            summary.totalLost,
+  });
+  log.info("TELEGRAM_DAILY_SUMMARY", { message: "Daily summary sent to Telegram." });
+
+  const resetCount = resetAllSlots();
+  log.info("INFO", {
+    message: `Daily reset complete: ${resetCount} idle slot(s) reset to $${CONFIG.slotInitialUsd}.`,
+    resetCount,
+  });
+
+  log.cleanup();
+}
+
+/**
+ * Schedules runDailyReset() at the next midnight UTC, then every 24 hours.
+ * Uses unref() so the timer does not prevent graceful shutdown.
+ */
+function scheduleDailyReset(): void {
+  const now     = Date.now();
+  const todayUTC = new Date(now);
+  const nextMidnightUTC = Date.UTC(
+    todayUTC.getUTCFullYear(),
+    todayUTC.getUTCMonth(),
+    todayUTC.getUTCDate() + 1,
+    0, 0, 0, 0,
+  );
+  const msUntilMidnight = nextMidnightUTC - now;
+
+  log.info("INFO", {
+    message: "Daily reset scheduled.",
+    nextResetAt: new Date(nextMidnightUTC).toISOString(),
+    inMinutes:   Math.round(msUntilMidnight / 60_000),
+  });
+
+  const t = setTimeout(() => {
+    runDailyReset();
+    setInterval(runDailyReset, 24 * 60 * 60 * 1000).unref();
+  }, msUntilMidnight);
+  t.unref();
 }
 
 process.on("SIGINT", () => shutdown("SIGINT"));

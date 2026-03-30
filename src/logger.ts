@@ -85,7 +85,9 @@ export type LogEvent =
   | "RESOLUTION_CANCELLED_READING"
   | "SHADOW_BET_FAILED"
   | "STOP_LOSS_PARTIAL_FILL"
-  | "BET_SKIPPED_DUPLICATE";
+  | "BET_SKIPPED_DUPLICATE"
+  | "SLOT_RESET"
+  | "TELEGRAM_DAILY_SUMMARY";
 
 interface LogEntry {
   ts: string;
@@ -110,6 +112,7 @@ const TRADE_EVENTS = new Set<LogEvent>([
   "REDEEM_RELAY_FAILED", "REDEEM_WAITING_RESOLUTION", "REDEEM_RESOLUTION_CONFIRMED",
   "REDEEM_RESOLUTION_TIMEOUT", "REDEEM_RESOLUTION_GAMMA_TRUE_ONCHAIN_PENDING",
   "REDEEM_SWEEP_SKIP_UNRESOLVED", "REDEEM_SWEEP_SAFE_ERROR",
+  "SLOT_RESET", "TELEGRAM_DAILY_SUMMARY",
 ]);
 
 const SYSTEM_EVENTS = new Set<LogEvent>([
@@ -142,6 +145,9 @@ const CONSOLE_EVENTS = new Set<LogEvent>([
   "REDEEM_RESOLUTION_TIMEOUT",
   "REDEEM_SWEEP_SAFE_ERROR",
   "REDEEM_SAFE_FALLBACK_EOA",
+  // Daily operations
+  "SLOT_RESET",
+  "TELEGRAM_DAILY_SUMMARY",
 ]);
 
 // ─── file paths ───────────────────────────────────────────────────────────────
@@ -283,5 +289,31 @@ export const log = {
       .filter((f) => f.endsWith(".log"))
       .sort()
       .map((f) => path.join(dir, f));
+  },
+
+  /**
+   * Deletes log files whose last-modified time is older than maxAgeMs.
+   * Called periodically to enforce a 1-day retention policy.
+   * Errors deleting individual files are silently ignored.
+   */
+  cleanup(maxAgeMs: number = 24 * 60 * 60 * 1000): void {
+    const dir = getLogDir();
+    if (!fs.existsSync(dir)) return;
+    const cutoff = Date.now() - maxAgeMs;
+    let deleted = 0;
+    for (const file of fs.readdirSync(dir)) {
+      if (!file.endsWith(".log")) continue;
+      const filePath = path.join(dir, file);
+      try {
+        const stat = fs.statSync(filePath);
+        if (stat.mtimeMs < cutoff) {
+          fs.unlinkSync(filePath);
+          deleted++;
+        }
+      } catch { /* skip files that cannot be stat'd or deleted */ }
+    }
+    if (deleted > 0) {
+      write("INFO", "INFO", { message: `Log cleanup: deleted ${deleted} file(s) older than ${maxAgeMs / 3600000}h.`, deleted });
+    }
   },
 };

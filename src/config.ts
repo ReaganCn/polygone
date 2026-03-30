@@ -125,6 +125,10 @@ export interface BotConfig {
   // Logging
   logFilePath: string;
 
+  // Telegram alerts (optional — leave blank to disable)
+  telegramBotToken: string;
+  telegramChatId: string;
+
   // Resolution polling
   resolutionPollIntervalMs: number;
 
@@ -187,6 +191,8 @@ function loadConfig(): BotConfig {
     shadowMode: parseBool("SHADOW_MODE", true),
 
     logFilePath: optionalEnv("LOG_FILE_PATH", "./logs/activity.log"),
+    telegramBotToken: optionalEnv("TELEGRAM_BOT_TOKEN", ""),
+    telegramChatId:   optionalEnv("TELEGRAM_CHAT_ID", ""),
     resolutionPollIntervalMs: parseInt_("RESOLUTION_POLL_INTERVAL_MS", 5000),
     apiPort: parseInt_("API_PORT", 3000),
   };

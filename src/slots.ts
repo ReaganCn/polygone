@@ -429,3 +429,36 @@ function clearSlot(slot: Slot): void {
 }
 
 function round2(n: number): number { return Math.round(n * 100) / 100; }
+
+// ─── daily reset ──────────────────────────────────────────────────────────────
+
+/**
+ * Resets the balance and initialBalance of every idle slot back to
+ * CONFIG.slotInitialUsd. Active and reserved slots (with in-flight bets)
+ * are skipped so running trades are not disrupted.
+ *
+ * Returns the number of slots that were reset.
+ * Called by the midnight UTC scheduler in index.ts and by POST /reset-slots.
+ */
+export function resetAllSlots(): number {
+  let resetCount = 0;
+  for (const slot of slots) {
+    if (slot.status !== "idle") continue;
+    const balanceBefore = slot.balance;
+    slot.balance = CONFIG.slotInitialUsd;
+    slot.initialBalance = CONFIG.slotInitialUsd;
+    log.info("SLOT_RESET", {
+      slotId: slot.id,
+      balanceBefore: round2(balanceBefore),
+      balanceAfter: round2(slot.balance),
+    });
+    resetCount++;
+  }
+  log.info("SLOT_STATE_SNAPSHOT", {
+    action: "daily_reset",
+    resetCount,
+    skippedActive: slots.length - resetCount,
+    slots: getSnapshot(),
+  });
+  return resetCount;
+}

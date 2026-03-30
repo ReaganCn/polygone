@@ -37,6 +37,7 @@ import {
 import { trackMarket, untrackMarket } from "./scanner.js";
 import { simulateBet } from "./shadow.js";
 import { redeemAfterWin } from "./redeemer.js";
+import { notifyBetPlaced, notifyWin, notifyLoss } from "./telegram.js";
 import type { Market, ActiveBet, BetRule } from "./types.js";
 
 // ─── module-level state ───────────────────────────────────────────────────────
@@ -301,6 +302,7 @@ export function handleWsResolution(
     });
 
     recordWin(bet.slotId, payoutUsd);
+    notifyWin(bet.market.asset, bet.side, bet.stakeUsd, payoutUsd, bet.rule);
 
     if (!bet.shadow) {
       redeemAfterWin(bet.market.conditionId, bet.market.question).catch(
@@ -318,6 +320,7 @@ export function handleWsResolution(
       stakeUsd: bet.stakeUsd, rule: bet.rule,
     });
     recordLoss(bet.slotId);
+    notifyLoss(bet.market.asset, bet.side, bet.stakeUsd, bet.rule);
   }
 
   untrackMarket(marketId);
@@ -336,6 +339,7 @@ async function handleShadowBet(
     const bet = simulateBet(market, slotId, stakeUsd, rule);
     activeBetsByMarketId.set(market.id, bet);
     assignBet(slotId, bet);
+    notifyBetPlaced(market.asset, market.winSide, stakeUsd, rule, market.winSidePrice);
     startFallbackResolutionWatcher(bet);
   } catch (err) {
     // Shadow bet setup failed — release the slot so it can be reused
@@ -387,6 +391,8 @@ async function handleLiveBet(
     priceAtBet: price, orderType: CONFIG.orderType,
     closesAt: market.closesAt, rule,
   });
+
+  notifyBetPlaced(market.asset, market.winSide, stakeUsd, rule, price);
 
   activeBetsByMarketId.set(market.id, bet);
   // [T2] assignBet transitions slot from "reserved" → "active" and attaches bet
