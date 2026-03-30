@@ -5,8 +5,12 @@
  *   1. Log startup info
  *   2. Initialise slot machine
  *   3. Initialise Polymarket CLOB client (skipped/warned in shadow mode)
- *   4. Start Express control panel
- *   5. Start WebSocket-driven scanner
+ *   4. Sweep unredeemed positions from previous sessions
+ *   5. Start Express control panel
+ *   6. Start WebSocket-driven scanner
+ *   7. Start 15 s periodic redeem sweep (background safety net)
+ *   8. Schedule midnight UTC daily reset + Telegram summary
+ *   9. Start hourly log cleanup
  *
  * Graceful shutdown on SIGINT / SIGTERM.
  */
@@ -18,7 +22,7 @@ import { initialiseClobClient } from "./polymarket.js";
 import { startScanner, stopScanner } from "./scanner.js";
 import { startApiServer } from "./api.js";
 import { handleQualifyingMarket, handleWsResolution } from "./trader.js";
-import { sweepUnredeemedPositions } from "./redeemer.js";
+import { sweepUnredeemedPositions, startPeriodicRedeemSweep } from "./redeemer.js";
 import { getSummary, resetAllSlots } from "./slots.js";
 import { notifyDailySummary } from "./telegram.js";
 
@@ -78,10 +82,14 @@ async function main(): Promise<void> {
     note: "Price updates arrive via WebSocket. Heartbeat HTTP fetch keeps market list fresh.",
   });
 
-  // 6. Schedule daily slot reset + Telegram summary at midnight UTC
+  // 6. Periodic redeem sweep every 15 s — catches any won positions that
+  //    redeemAfterWin() missed (timeout, relay failure, restart, etc.).
+  startPeriodicRedeemSweep(15_000).unref();
+
+  // 7. Schedule daily slot reset + Telegram summary at midnight UTC
   scheduleDailyReset();
 
-  // 7. Purge logs older than 24 h — run immediately then every hour
+  // 8. Purge logs older than 24 h — run immediately then every hour
   log.cleanup();
   setInterval(() => log.cleanup(), 60 * 60 * 1000).unref();
 }

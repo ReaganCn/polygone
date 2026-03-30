@@ -534,3 +534,46 @@ export async function sweepUnredeemedPositions(): Promise<void> {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// ─── Periodic background sweep ────────────────────────────────────────────────
+
+/** Guard: prevents two overlapping sweepUnredeemedPositions() calls. */
+let _sweepRunning = false;
+
+/**
+ * Starts a background timer that calls sweepUnredeemedPositions() every
+ * intervalMs milliseconds. A concurrency guard prevents a new sweep from
+ * starting before the previous one finishes (e.g. if RPC calls are slow).
+ *
+ * Returns the interval handle so the caller can unref() or clear it.
+ *
+ * This is the "10-20s check" that catches every won position that
+ * redeemAfterWin() may have missed (timeout, relay failure, restart, etc.).
+ */
+export function startPeriodicRedeemSweep(
+  intervalMs: number = 15_000,
+): ReturnType<typeof setInterval> {
+  log.info("INFO", {
+    message: "Periodic redeem sweep started.",
+    intervalMs,
+  });
+
+  const handle = setInterval(async () => {
+    if (_sweepRunning) return; // skip tick if previous sweep still running
+    _sweepRunning = true;
+    try {
+      await sweepUnredeemedPositions();
+    } catch (err) {
+      log.error("REDEEM_SWEEP_ERROR", {
+        conditionId: "periodic",
+        question:    "background sweep",
+        attempt:     0,
+        error:       (err as Error).message,
+      });
+    } finally {
+      _sweepRunning = false;
+    }
+  }, intervalMs);
+
+  return handle;
+}
