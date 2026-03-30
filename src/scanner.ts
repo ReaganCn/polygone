@@ -56,11 +56,12 @@ let isRunning = false;
 
 export async function startScanner(
   onMarketFound: MarketCallback,
-  onMarketResolved: ResolutionCallback
+  onMarketResolved: ResolutionCallback,
+  initialPaused = false,
 ): Promise<void> {
   if (isRunning) return;
   isRunning = true;
-  isPaused = false;
+  isPaused = initialPaused;
   onMarketFoundCb = onMarketFound;
   onMarketResolvedCb = onMarketResolved;
 
