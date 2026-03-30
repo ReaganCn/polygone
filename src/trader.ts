@@ -13,10 +13,15 @@ import { placeOrder, fetchMarketResolution } from "./polymarket.js";
 import { getIdleSlot, reserveSlot, releaseSlot, assignBet, recordWin, recordLoss } from "./slots.js";
 import { trackMarket, untrackMarket } from "./scanner.js";
 import { simulateBet } from "./shadow.js";
-import { redeemAfterWin } from "./redeemer.js";
+import { enqueueRedemption } from "./redemptionQueue.js";
 import type { Market, ActiveBet, BetRule } from "./types.js";
 
 const activeBetsByMarketId = new Map<string, ActiveBet>();
+
+/** Clear tracking of bets that have already been resolved. Called during daily reset. */
+export function getActiveBetCount(): number {
+  return activeBetsByMarketId.size;
+}
 
 function generateBetId(): string {
   return `bet-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
@@ -87,11 +92,9 @@ export function handleWsResolution(
 
     recordWin(bet.slotId, payoutUsd);
 
-    // FIX: Pass the full bet.market object instead of just conditionId
+    // Queue redemption for sequential processing with retry
     if (!bet.shadow) {
-      redeemAfterWin(bet.market).catch(err => 
-        log.error("REDEEM_UNCAUGHT", { marketId, error: err.message })
-      );
+      enqueueRedemption(bet.market);
     }
   } else {
     log.info(bet.shadow ? "SHADOW_RESOLUTION_LOSS" : "RESOLUTION_LOSS", {

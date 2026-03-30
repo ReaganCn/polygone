@@ -58,10 +58,19 @@ function getRelayClient(): RelayClient {
 
 // Inside redeemer.ts -> pollForSettlement
 // Inside redeemer.ts -> pollForSettlement
-async function pollForSettlement(conditionId: string): Promise<boolean> {
+interface RedemptionAttemptOptions {
+  settlementMaxChecks?: number;
+  settlementPollMs?: number;
+}
+
+async function pollForSettlement(
+  conditionId: string,
+  maxChecks: number,
+  pollMs: number,
+): Promise<boolean> {
   log.info("REDEEM_POLLING_SETTLEMENT", { conditionId });
   
-  for (let i = 0; i < 120; i++) { 
+  for (let i = 0; i < maxChecks; i++) {
     try {
       const denominator = await publicClient.readContract({
         address: CTF_ADDRESS,
@@ -82,15 +91,24 @@ async function pollForSettlement(conditionId: string): Promise<boolean> {
         log.warn("REDEEM_RPC_POLLING_RETRY", { conditionId });
       }
     }
-    await new Promise(r => setTimeout(r, 10000));
+    if (pollMs > 0) {
+      await new Promise(r => setTimeout(r, pollMs));
+    }
   }
   return false;
 }
 
-export async function redeemAfterWin(market: Market): Promise<void> {
+export async function redeemAfterWin(
+  market: Market,
+  options: RedemptionAttemptOptions = {},
+): Promise<void> {
   if (CONFIG.shadowMode) return;
 
-  const settled = await pollForSettlement(market.conditionId);
+  const settled = await pollForSettlement(
+    market.conditionId,
+    options.settlementMaxChecks ?? 120,
+    options.settlementPollMs ?? 10000,
+  );
   if (!settled) {
     log.error("REDEEM_FAILED_SETTLEMENT_TIMEOUT", { market: market.question });
     return;
@@ -140,5 +158,21 @@ export async function redeemAfterWin(market: Market): Promise<void> {
     console.info("REDEEM_CONFIRMED", { txHash: (receipt as any).transactionHash, market: market.question });
   } catch (err) {
     log.error("REDEEM_ERROR", { market: market.question, error: (err as Error).message });
+  }
+}
+
+// ─── Verification: check if tokens have been fully redeemed ──────────────────
+
+export async function verifyRedemption(market: Market): Promise<boolean> {
+  const walletAddress = CONFIG.polymarketFunderAddress as Hex;
+  try {
+    const [yesBal, noBal] = await Promise.all([
+      publicClient.readContract({ address: CTF_ADDRESS, abi: CTF_ABI, functionName: "balanceOf", args: [walletAddress, BigInt(market.yesTokenId)] }),
+      publicClient.readContract({ address: CTF_ADDRESS, abi: CTF_ABI, functionName: "balanceOf", args: [walletAddress, BigInt(market.noTokenId)] })
+    ]);
+    return (yesBal as bigint) === 0n && (noBal as bigint) === 0n;
+  } catch (err) {
+    log.error("REDEEM_ERROR", { market: market.question, error: `Verify failed: ${(err as Error).message}` });
+    return false;
   }
 }
