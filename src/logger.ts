@@ -62,6 +62,7 @@ export type LogEvent =
   | "BOT_RESUMED"
   | "CONFIG_UPDATED"
   | "RESOLUTION_POLLING"
+  | "LOG_CLEANUP"
   // General
   | "INFO"
   | "WARN"
@@ -92,6 +93,7 @@ const SYSTEM_EVENTS = new Set<LogEvent>([
   "RESOLUTION_POLLING",
   "REDEEM_POLLING_SETTLEMENT",
   "REDEEM_SETTLEMENT_CONFIRMED_ONCHAIN",
+  "LOG_CLEANUP",
   "INFO",
 ]);
 
@@ -247,5 +249,41 @@ export const log = {
       .filter((f) => f.endsWith(".log"))
       .sort()
       .map((f) => path.join(dir, f));
+  },
+
+  /**
+   * Delete log files older than maxAgeMs (default 24 hours).
+   * Parses the YYYY-MM-DD-HH suffix to determine each file's age.
+   */
+  cleanup(maxAgeMs: number = 24 * 60 * 60 * 1000): void {
+    const dir = getLogDir();
+    if (!fs.existsSync(dir)) return;
+
+    const now = Date.now();
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith(".log"));
+    let deleted = 0;
+
+    for (const file of files) {
+      // Extract YYYY-MM-DD-HH from filename like "trades-2026-03-29-14.log"
+      const match = file.match(/(\d{4})-(\d{2})-(\d{2})-(\d{2})\.log$/);
+      if (!match) continue;
+
+      const [, year, month, day, hour] = match;
+      const fileDate = new Date(Date.UTC(
+        parseInt(year), parseInt(month) - 1, parseInt(day), parseInt(hour)
+      ));
+      const ageMs = now - fileDate.getTime();
+
+      if (ageMs > maxAgeMs) {
+        try {
+          fs.unlinkSync(path.join(dir, file));
+          deleted++;
+        } catch { /* skip */ }
+      }
+    }
+
+    if (deleted > 0) {
+      write("INFO", "LOG_CLEANUP", { deletedFiles: deleted, maxAgeHours: Math.round(maxAgeMs / 3600_000) });
+    }
   },
 };

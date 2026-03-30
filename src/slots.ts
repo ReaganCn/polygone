@@ -71,6 +71,33 @@ export function initialiseSlots(): void {
   log.info("SLOT_STATE_SNAPSHOT", { action: "initialised", slots: getSnapshot() });
 }
 
+/**
+ * Reset all slots to initial capital for a new day.
+ * Active bets are left to resolve naturally — only idle/pending slots are reset.
+ * Returns the pre-reset summary for use in end-of-day alerts.
+ */
+export function resetSlots(): ReturnType<typeof getSummary> {
+  const summaryBeforeReset = getSummary();
+
+  for (const slot of slots) {
+    // Leave active bets alone — they'll resolve into the new day's stats
+    if (slot.status === "active" && slot.activeBet) continue;
+
+    slot.status = "idle";
+    slot.balance = CONFIG.slotInitialUsd;
+    slot.initialBalance = CONFIG.slotInitialUsd;
+    slot.totalProfitExtracted = 0;
+    slot.totalLost = 0;
+    slot.wins = 0;
+    slot.losses = 0;
+    slot.ruleStats = emptyRuleStats();
+    slot.activeBet = undefined;
+  }
+
+  log.info("SLOT_STATE_SNAPSHOT", { action: "daily_reset", slots: getSnapshot() });
+  return summaryBeforeReset;
+}
+
 // ─── queries ──────────────────────────────────────────────────────────────────
 
 export function getIdleSlot(): Slot | null {

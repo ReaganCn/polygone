@@ -20,12 +20,14 @@
 
 import { CONFIG } from "./config.js";
 import { log } from "./logger.js";
-import { initialiseSlots, getSummary } from "./slots.js";
+import { initialiseSlots, getSummary, resetSlots } from "./slots.js";
 import { initialiseClobClient } from "./polymarket.js";
 import { startScanner, stopScanner, pauseScanner, resumeScanner, isPausedState } from "./scanner.js";
 import { startApiServer } from "./api.js";
 import { handleQualifyingMarket, handleWsResolution } from "./trader.js";
 import { dailyState } from "./dailyState.js";
+import { startRedemptionQueue, stopRedemptionQueue } from "./redemptionQueue.js";
+import { sendTelegramAlert, formatStatusMessage } from "./telegram.js";
 
 async function main(): Promise<void> {
   log.info("BOT_STARTED", {
@@ -74,12 +76,17 @@ async function main(): Promise<void> {
   // 3. Start control panel
   startApiServer();
 
-  // 4. Start WebSocket-driven scanner
-  await startScanner(handleQualifyingMarket, handleWsResolution);
+  // 4. Start redemption queue (loads pending entries from disk)
+  startRedemptionQueue();
 
-  // 5. Start supervisor loop — runs immediately then every 60 seconds
+  // 5. Run supervisor BEFORE scanner to establish pause state first.
+  //    This prevents the race condition where the scanner fires bets
+  //    before the supervisor has a chance to pause it.
   supervisorTick();
   setInterval(supervisorTick, 60_000);
+
+  // 6. Start WebSocket-driven scanner (pause state already set)
+  await startScanner(handleQualifyingMarket, handleWsResolution, isPausedState());
 
   log.info("BOT_STARTED", {
     message: "Bot is running.",
@@ -100,11 +107,35 @@ function supervisorTick(): void {
   const todayUtcDate = new Date().getUTCDate();
   if (todayUtcDate !== lastSeenUtcDate) {
     lastSeenUtcDate = todayUtcDate;
-    dailyState.startOfDayPnl = netPnl;
-    log.info("INFO", { message: "UTC midnight — daily P&L reset.", startOfDayPnl: netPnl });
+
+    // Reset slots first so summary reflects fresh day values.
+    resetSlots();
+    dailyState.startOfDayPnl = 0;
+
+    // Clean up old log files (>24 hours)
+    log.cleanup(24 * 60 * 60 * 1000);
+
+    // Send new-day reset summary (values should be reset for the day).
+    const resetSummary = getSummary();
+    const resetMessage = formatStatusMessage(resetSummary, {
+      tradingWindowStart: CONFIG.tradingStartTime,
+      tradingWindowEnd: CONFIG.tradingEndTime,
+      dailyNetPnl: 0,
+      dailyProfitTarget: CONFIG.dailyProfitTarget,
+      dailyLossLimit: CONFIG.dailyLossLimit,
+    }, {
+      paused: isPausedState(),
+      shadowMode: CONFIG.shadowMode,
+    });
+    sendTelegramAlert(resetMessage).catch(() => {});
+
+    log.info("INFO", { message: "UTC midnight — daily reset complete. Slots, PnL, trades zeroed." });
   }
 
-  const netPnlToday = round2(netPnl - dailyState.startOfDayPnl);
+  // Recompute after potential reset
+  const summaryNow = getSummary();
+  const netPnlNow = round2(summaryNow.totalProfitExtracted - summaryNow.totalLost);
+  const netPnlToday = round2(netPnlNow - dailyState.startOfDayPnl);
 
   const withinHours = isWithinTradingHours();
   const profitHit   = CONFIG.dailyProfitTarget !== null && netPnlToday >= CONFIG.dailyProfitTarget;
@@ -120,6 +151,19 @@ function supervisorTick(): void {
         : "daily_loss_limit_reached";
     log.info("BOT_PAUSED", { reason, netPnlToday, withinHours });
     pauseScanner();
+
+    // Send Telegram alert on pause
+    const pauseMessage = formatStatusMessage(summaryNow, {
+      tradingWindowStart: CONFIG.tradingStartTime,
+      tradingWindowEnd: CONFIG.tradingEndTime,
+      dailyNetPnl: netPnlToday,
+      dailyProfitTarget: CONFIG.dailyProfitTarget,
+      dailyLossLimit: CONFIG.dailyLossLimit,
+    }, {
+      paused: true,
+      shadowMode: CONFIG.shadowMode,
+    });
+    sendTelegramAlert(pauseMessage).catch(() => {});
   } else if (!shouldPause && isPausedState()) {
     log.info("BOT_RESUMED", { message: "Conditions met — resuming.", netPnlToday, withinHours });
     resumeScanner();
@@ -137,6 +181,7 @@ function isWithinTradingHours(): boolean {
 function shutdown(signal: string): void {
   log.info("INFO", { message: `Received ${signal} — shutting down gracefully...` });
   stopScanner();
+  stopRedemptionQueue();
   setTimeout(() => {
     log.info("INFO", { message: "Shutdown complete." });
     process.exit(0);

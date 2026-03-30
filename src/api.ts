@@ -21,6 +21,7 @@ import { log } from "./logger.js";
 import { getSnapshot, getActiveBets, getSummary } from "./slots.js";
 import { pauseScanner, resumeScanner, isPausedState } from "./scanner.js";
 import { dailyState } from "./dailyState.js";
+import { getRedemptionStatus } from "./redemptionQueue.js";
 import type { MutableConfigKeys } from "./config.js";
 
 export function startApiServer(): void {
@@ -200,6 +201,15 @@ export function startApiServer(): void {
     res.json({ files: log.listFiles() });
   });
 
+  // ── GET /redemptions ────────────────────────────────────────────────────────
+  app.get("/redemptions", (_req: Request, res: Response) => {
+    const entries = getRedemptionStatus();
+    const pending = entries.filter(e => e.status === "pending" || e.status === "processing").length;
+    const completed = entries.filter(e => e.status === "completed").length;
+    const failed = entries.filter(e => e.status === "failed").length;
+    res.json({ summary: { total: entries.length, pending, completed, failed }, entries });
+  });
+
   app.listen(CONFIG.apiPort, "127.0.0.1", () => {
     log.info("BOT_STARTED", {
       message: `Control panel on http://127.0.0.1:${CONFIG.apiPort}`,
@@ -211,6 +221,7 @@ export function startApiServer(): void {
         "POST /resume",
         "GET  /logs?tail=N&cat=trades|errors|system",
         "GET  /logs/files",
+        "GET  /redemptions",
       ],
     });
   });
