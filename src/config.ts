@@ -135,6 +135,11 @@ export interface BotConfig {
   dailyProfitTarget: number | null;
   dailyLossLimit: number | null;
   // ──────────────────────────────────────────────────────────────────────────
+
+  // ── Telegram alerts ─────────────────────────────────────────────────────
+  telegramBotToken: string;
+  telegramChatId: string;
+  // ──────────────────────────────────────────────────────────────────────────
 }
 
 function loadConfig(): BotConfig {
@@ -196,6 +201,9 @@ function loadConfig(): BotConfig {
       ? parseFloat_("DAILY_PROFIT_TARGET", 0) : null,
     dailyLossLimit: process.env["DAILY_LOSS_LIMIT"]
       ? parseFloat_("DAILY_LOSS_LIMIT", 0) : null,
+
+    telegramBotToken: optionalEnv("TELEGRAM_BOT_TOKEN", ""),
+    telegramChatId:   optionalEnv("TELEGRAM_CHAT_ID", ""),
   };
 }
 
