@@ -25,7 +25,7 @@ import { initialiseClobClient } from "./polymarket.js";
 import { startScanner, stopScanner, pauseScanner, resumeScanner, isPausedState } from "./scanner.js";
 import { startApiServer } from "./api.js";
 import { handleQualifyingMarket, handleWsResolution } from "./trader.js";
-import { dailyState } from "./dailyState.js";
+import { dailyState, savePauseState, clearPauseState, loadPauseState } from "./dailyState.js";
 import { startRedemptionQueue, stopRedemptionQueue } from "./redemptionQueue.js";
 import { sendTelegramAlert, formatStatusMessage } from "./telegram.js";
 
@@ -79,13 +79,22 @@ async function main(): Promise<void> {
   // 4. Start redemption queue (loads pending entries from disk)
   startRedemptionQueue();
 
-  // 5. Run supervisor BEFORE scanner to establish pause state first.
+  // 5. Restore a persisted pause from a previous run within the same UTC day.
+  //    Must happen BEFORE supervisorTick() to prevent a brief trading window.
+  const restoredReason = loadPauseState();
+  if (restoredReason) {
+    dailyState.isPersistentlyPaused = true;
+    pauseScanner();
+    log.info("BOT_PAUSED", { reason: restoredReason, restored: true });
+  }
+
+  // 6. Run supervisor BEFORE scanner to establish pause state first.
   //    This prevents the race condition where the scanner fires bets
   //    before the supervisor has a chance to pause it.
   supervisorTick();
   setInterval(supervisorTick, 60_000);
 
-  // 6. Start WebSocket-driven scanner (pause state already set)
+  // 7. Start WebSocket-driven scanner (pause state already set)
   await startScanner(handleQualifyingMarket, handleWsResolution, isPausedState());
 
   log.info("BOT_STARTED", {
@@ -130,6 +139,8 @@ function supervisorTick(): void {
     });
     sendTelegramAlert(resetMessage).catch(() => {});
     pendingFinalPauseMessage = false;
+    dailyState.isPersistentlyPaused = false;
+    clearPauseState();
 
     log.info("INFO", { message: "UTC midnight — daily reset complete. Slots, PnL, trades zeroed." });
   }
@@ -143,7 +154,7 @@ function supervisorTick(): void {
   const profitHit   = CONFIG.dailyProfitTarget !== null && netPnlToday >= CONFIG.dailyProfitTarget;
   const lossHit     = CONFIG.dailyLossLimit    !== null && netPnlToday <= -CONFIG.dailyLossLimit;
 
-  const shouldPause = !withinHours || profitHit || lossHit;
+  const shouldPause = !withinHours || profitHit || lossHit || dailyState.isPersistentlyPaused;
 
   if (shouldPause && !isPausedState()) {
     const reason = !withinHours
@@ -166,10 +177,14 @@ function supervisorTick(): void {
       shadowMode: CONFIG.shadowMode,
     });
     sendTelegramAlert(pauseMessage).catch(() => {});
+    dailyState.isPersistentlyPaused = true;
+    savePauseState(reason);
     if (summaryNow.activeSlots > 0) pendingFinalPauseMessage = true;
   } else if (!shouldPause && isPausedState()) {
     log.info("BOT_RESUMED", { message: "Conditions met — resuming.", netPnlToday, withinHours });
     resumeScanner();
+    dailyState.isPersistentlyPaused = false;
+    clearPauseState();
     pendingFinalPauseMessage = false;
   }
 
