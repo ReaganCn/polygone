@@ -98,6 +98,7 @@ async function main(): Promise<void> {
 // ─── supervisor ───────────────────────────────────────────────────────────────
 
 let lastSeenUtcDate = new Date().getUTCDate();
+let pendingFinalPauseMessage = false;
 
 function supervisorTick(): void {
   const summary = getSummary();
@@ -128,6 +129,7 @@ function supervisorTick(): void {
       shadowMode: CONFIG.shadowMode,
     });
     sendTelegramAlert(resetMessage).catch(() => {});
+    pendingFinalPauseMessage = false;
 
     log.info("INFO", { message: "UTC midnight — daily reset complete. Slots, PnL, trades zeroed." });
   }
@@ -164,9 +166,33 @@ function supervisorTick(): void {
       shadowMode: CONFIG.shadowMode,
     });
     sendTelegramAlert(pauseMessage).catch(() => {});
+    if (summaryNow.activeSlots > 0) pendingFinalPauseMessage = true;
   } else if (!shouldPause && isPausedState()) {
     log.info("BOT_RESUMED", { message: "Conditions met — resuming.", netPnlToday, withinHours });
     resumeScanner();
+    pendingFinalPauseMessage = false;
+  }
+
+  // If there were active bets when the bot paused, send a final status message
+  // once they have all settled — giving the complete picture.
+  if (isPausedState() && pendingFinalPauseMessage) {
+    const settledSummary = getSummary();
+    if (settledSummary.activeSlots === 0) {
+      const settledNetPnl = round2(settledSummary.totalProfitExtracted - settledSummary.totalLost);
+      const settledNetPnlToday = round2(settledNetPnl - dailyState.startOfDayPnl);
+      const finalMessage =
+        "=== ALL TRADES SETTLED ===\n" +
+        formatStatusMessage(settledSummary, {
+          tradingWindowStart: CONFIG.tradingStartTime,
+          tradingWindowEnd: CONFIG.tradingEndTime,
+          dailyNetPnl: settledNetPnlToday,
+          dailyProfitTarget: CONFIG.dailyProfitTarget,
+          dailyLossLimit: CONFIG.dailyLossLimit,
+        }, { paused: true, shadowMode: CONFIG.shadowMode });
+      sendTelegramAlert(finalMessage).catch(() => {});
+      pendingFinalPauseMessage = false;
+      log.info("BOT_PAUSED_FINAL_STATUS_SENT", { settledNetPnlToday });
+    }
   }
 }
 

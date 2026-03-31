@@ -59,6 +59,7 @@ export type LogEvent =
   // Bot lifecycle → system log
   | "BOT_STARTED"
   | "BOT_PAUSED"
+  | "BOT_PAUSED_FINAL_STATUS_SENT"
   | "BOT_RESUMED"
   | "CONFIG_UPDATED"
   | "RESOLUTION_POLLING"
