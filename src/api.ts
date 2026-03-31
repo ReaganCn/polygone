@@ -20,7 +20,7 @@ import { CONFIG, updateConfig } from "./config.js";
 import { log } from "./logger.js";
 import { getSnapshot, getActiveBets, getSummary } from "./slots.js";
 import { pauseScanner, resumeScanner, isPausedState } from "./scanner.js";
-import { dailyState } from "./dailyState.js";
+import { dailyState, clearPauseState } from "./dailyState.js";
 import { getRedemptionStatus } from "./redemptionQueue.js";
 import type { MutableConfigKeys } from "./config.js";
 
@@ -176,8 +176,8 @@ export function startApiServer(): void {
 
   // ── POST /resume ─────────────────────────────────────────────────────────────
   app.post("/resume", (_req: Request, res: Response) => {
-    if (!isPausedState()) { res.json({ message: "Already running." }); return; }
-    resumeScanner();
+    if (!isPausedState()) { res.json({ message: "Already running." }); return; }    dailyState.isPersistentlyPaused = false;
+    clearPauseState();    resumeScanner();
     res.json({ success: true, message: "Resumed." });
   });
 
