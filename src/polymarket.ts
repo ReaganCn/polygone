@@ -271,9 +271,6 @@ export async function fetchCryptoMarkets(): Promise<Market[]> {
 
         const price0 = prices[0];
         const price1 = prices[1];
-        const winSide: "YES" | "NO" = price0 >= price1 ? "YES" : "NO";
-        const winSidePrice = price0 >= price1 ? price0 : price1;
-        const tokenIdToBuy = price0 >= price1 ? tokenIds[0] : tokenIds[1];
 
         // BUG 4 FIX: Validate tick size is a known value, default to "0.01"
         const rawTickSize = detail.orderPriceMinTickSize?.toString() ?? "0.01";
@@ -284,16 +281,15 @@ export async function fetchCryptoMarkets(): Promise<Market[]> {
         seen.add(m.id);
         results.push({
           id: m.id,
-          conditionId: detail.conditionId,  // ← mapped from Gamma API response
+          conditionId: detail.conditionId,
           question: detail.question ?? event.title ?? slug,
           asset, duration,
           closesAt: endDateStr,
           timeRemainingSeconds,
-          winSide,
-          winSidePrice: round4(winSidePrice),
+          yesPrice: round4(price0),
+          noPrice: round4(price1),
           yesTokenId: tokenIds[0],
           noTokenId: tokenIds[1],
-          tokenIdToBuy,
           negRisk: event.negRisk ?? false,
           tickSize,
         });
@@ -394,110 +390,99 @@ export async function fetchMarketResolution(
 
 // ─── order placement ──────────────────────────────────────────────────────────
 
-export async function placeOrder(market: Market, stakeUsd: number): Promise<OrderResult> {
+export async function placeStraddleLegOrder(
+  tokenId: string,
+  price: number,
+  shares: number,
+  tickSize: string,
+  negRisk: boolean,
+  orderTypeOverride?: "FOK" | "FAK" | "GTC" | "GTD",
+): Promise<OrderResult> {
   const client = getClobClient();
-
-  const orderTypeMap: Record<string, OrderType> = {
-    GTC: OrderType.GTC, GTD: OrderType.GTD,
-    FOK: OrderType.FOK, FAK: OrderType.FAK,
-  };
-  const orderType = orderTypeMap[CONFIG.orderType] ?? OrderType.FOK;
-  const price = market.winSidePrice;
-  const tickSize = market.tickSize as TickSize;
-
-  // BUG 2 FIX: Pre-flight balance check
-  try {
-    const balance = await getUsdcBalance();
-    if (balance < stakeUsd) {
-      const error = `Insufficient USDC balance: have $${balance.toFixed(2)}, need $${stakeUsd}`;
-      log.error("ORDER_FAILED", { marketId: market.id, stakeUsd, balance, error });
-      return { success: false, error };
-    }
-    log.info("INFO", { message: `Balance check passed: $${balance.toFixed(2)} available` });
-  } catch (err) {
-    log.warn("WARN", {
-      message: "Could not check USDC balance before order — proceeding anyway",
-      error: (err as Error).message,
-    });
-  }
+  const orderType = orderTypeOverride ?? CONFIG.orderType;
+  const orderTypeEnum = { GTC: OrderType.GTC, GTD: OrderType.GTD, FOK: OrderType.FOK, FAK: OrderType.FAK }[orderType] ?? OrderType.FOK;
+  const validTickSize: TickSize = VALID_TICK_SIZES.includes(tickSize as TickSize) ? (tickSize as TickSize) : "0.01";
 
   try {
     let resp: unknown;
 
-    if (orderType === OrderType.FOK || orderType === OrderType.FAK) {
-      // BUG 1 FIX: Use createAndPostMarketOrder() for FOK/FAK
+    if (orderTypeEnum === OrderType.FOK || orderTypeEnum === OrderType.FAK) {
+      const amount = shares * price;
       resp = await client.createAndPostMarketOrder(
-        {
-          tokenID: market.tokenIdToBuy,
-          amount: stakeUsd,
-          side: Side.BUY,
-          price,
-        },
-        { tickSize, negRisk: market.negRisk },
-        orderType
+        { tokenID: tokenId, amount, side: Side.BUY, price },
+        { tickSize: validTickSize, negRisk },
+        orderTypeEnum,
       );
     } else {
-      // GTC/GTD: limit order
-      // BUG 3 FIX: Use correctly validated size
-      const sizeShares = roundSizeForPrecision(stakeUsd / price, price);
-
+      const size = roundSizeForPrecision(shares, price);
       resp = await client.createAndPostOrder(
-        {
-          tokenID: market.tokenIdToBuy,
-          price,
-          size: sizeShares,
-          side: Side.BUY,
-        },
-        { tickSize, negRisk: market.negRisk },
-        orderType
+        { tokenID: tokenId, price, size, side: Side.BUY },
+        { tickSize: validTickSize, negRisk },
+        orderTypeEnum,
       );
     }
 
     const r = resp as Record<string, unknown>;
-
     const errorMsg = r["errorMsg"] ?? r["error"];
     const status = r["status"] as string | undefined;
     const orderId = (r["orderId"] ?? r["id"] ?? r["orderID"] ?? "") as string;
     const isRejected =
       (typeof errorMsg === "string" && errorMsg.length > 0 && !orderId) ||
-      status === "rejected" ||
-      status === "error";
+      status === "rejected" || status === "error";
 
     if (isRejected) {
       const errorText = String(errorMsg ?? status ?? "Order rejected by CLOB");
-      log.error("ORDER_FAILED", {
-        marketId: market.id,
-        tokenId: market.tokenIdToBuy,
-        stakeUsd, price, orderType: CONFIG.orderType,
-        error: errorText,
-        rawResponse: resp,
-      });
+      log.error("ORDER_FAILED", { tokenId, price, shares, orderType, error: errorText, rawResponse: resp });
       return { success: false, error: errorText };
     }
-    
 
-    log.info("ORDER_RESPONSE", {
-      marketId: market.id,
-      tokenId: market.tokenIdToBuy,
-      side: market.winSide,
-      stakeUsd, price,
-      orderType: CONFIG.orderType,
-      orderId, status,
-      rawResponse: resp,
-    });
+    log.info("ORDER_RESPONSE", { tokenId, price, shares, orderType, orderId, status, rawResponse: resp });
 
     return {
       success: true,
       orderId: orderId || undefined,
       avgPrice: price,
-      filled: orderType === OrderType.FOK || orderType === OrderType.FAK,
+      filled: orderTypeEnum === OrderType.FOK || orderTypeEnum === OrderType.FAK,
       rawResponse: resp,
     };
   } catch (err) {
     const error = (err as Error).message;
-    log.error("ORDER_FAILED", { marketId: market.id, stakeUsd, error });
+    log.error("ORDER_FAILED", { tokenId, price, shares, error });
     return { success: false, error };
   }
+}
+
+// ─── order management ─────────────────────────────────────────────────────────
+
+export async function cancelOpenOrder(orderId: string): Promise<boolean> {
+  const client = getClobClient();
+  try {
+    await client.cancelOrder({ orderID: orderId });
+    log.info("ORDER_CANCELLED", { orderId });
+    return true;
+  } catch (err) {
+    log.error("CANCEL_FAILED", { orderId, error: (err as Error).message });
+    return false;
+  }
+}
+
+export async function getOrderFillStatus(orderId: string): Promise<{
+  filled: boolean;
+  sizeMatched: number;
+  originalSize: number;
+  status: string;
+}> {
+  const client = getClobClient();
+  const order = await client.getOrder(orderId) as unknown as Record<string, unknown>;
+  const sizeMatched = Number(order["size_matched"] ?? 0);
+  const originalSize = Number(order["original_size"] ?? 0);
+  const status = String(order["status"] ?? "unknown");
+  return {
+    filled: sizeMatched >= originalSize && originalSize > 0,
+    sizeMatched,
+    originalSize,
+    status,
+  };
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
