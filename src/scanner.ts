@@ -1,25 +1,13 @@
 /**
- * scanner.ts — WebSocket-driven market scanner.
+ * scanner.ts — WebSocket-driven market scanner with dump detection.
  *
- * Qualifying rules (all configurable, all hot-updatable):
- *
- *   5m rule:  market.duration === "5m"
- *             && CONFIG.enable5m
- *             && timeRemaining <= CONFIG.maxTimeRemaining5m
- *             && price in [priceRangeMin5m, priceRangeMax5m]
- *
- *   15m rule: market.duration === "15m"
- *             && CONFIG.enable15m
- *             && timeRemaining <= CONFIG.maxTimeRemaining15m
- *             && price in [priceRangeMin15m, priceRangeMax15m]
- *
- *   fallback: CONFIG.enableFallback
- *             && timeRemaining <= CONFIG.fallbackTimeRemainingS
- *             && price <= CONFIG.fallbackMaxPrice
- *             (applies to any duration — catches near-expiry markets)
- *
- * Rules are checked in order: 5m → 15m → fallback.
- * A market only fires one callback per evaluation (first matching rule wins).
+ * Replaces the old qualifying-rule approach with:
+ *   1. Rolling price history per token (priceHistory map)
+ *   2. checkForDump() — detects sudden price drops
+ *   3. Dual dispatch:
+ *      - Tracked markets → onPriceUpdate callback (for fill monitor DCA/stop-loss)
+ *      - Untracked markets → dump detection → onDumpDetected callback
+ *   4. Four callbacks: onDumpDetected, onPriceUpdate, onMarketResolved, initialPaused
  */
 
 import { CONFIG } from "./config.js";
@@ -31,21 +19,48 @@ import {
   unsubscribeTokenIds,
   disconnectWebSocket,
   getTokenPrice,
-  type WsCallbacks,
   type TokenPrice,
   type ResolvedMarketEvent,
   type NewMarketEvent,
 } from "./websocket.js";
 import type { Market, BetRule } from "./types.js";
 
-type MarketCallback = (market: Market, rule: BetRule) => void;
-type ResolutionCallback = (marketId: string, winningTokenId: string, winningOutcome: string) => void;
+// ─── callback types ───────────────────────────────────────────────────────────
+
+type DumpCallback = (
+  market: Market,
+  dumpedSide: "YES" | "NO",
+  dumpAsk: number,
+  oppositeAsk: number,
+  rule: BetRule,
+) => void;
+
+type PriceUpdateCallback = (
+  marketId: string,
+  yesPrice: number,
+  noPrice: number,
+) => void;
+
+type ResolutionCallback = (
+  marketId: string,
+  winningTokenId: string,
+  winningOutcome: string,
+) => void;
+
+// ─── state ────────────────────────────────────────────────────────────────────
+
+interface PriceSnapshot {
+  timestamp: number;
+  ask: number;
+}
 
 const knownMarkets = new Map<string, Market>();
 const tokenToMarket = new Map<string, string>();
 const trackedMarketIds = new Set<string>();
+const priceHistory = new Map<string, PriceSnapshot[]>();
 
-let onMarketFoundCb: MarketCallback | null = null;
+let onDumpDetectedCb: DumpCallback | null = null;
+let onPriceUpdateCb: PriceUpdateCallback | null = null;
 let onMarketResolvedCb: ResolutionCallback | null = null;
 let heartbeatHandle: ReturnType<typeof setInterval> | null = null;
 let wsConnected = false;
@@ -55,14 +70,16 @@ let isRunning = false;
 // ─── public API ───────────────────────────────────────────────────────────────
 
 export async function startScanner(
-  onMarketFound: MarketCallback,
+  onDumpDetected: DumpCallback,
+  onPriceUpdate: PriceUpdateCallback,
   onMarketResolved: ResolutionCallback,
   initialPaused = false,
 ): Promise<void> {
   if (isRunning) return;
   isRunning = true;
   isPaused = initialPaused;
-  onMarketFoundCb = onMarketFound;
+  onDumpDetectedCb = onDumpDetected;
+  onPriceUpdateCb = onPriceUpdate;
   onMarketResolvedCb = onMarketResolved;
 
   await fetchWithRetry();
@@ -72,13 +89,17 @@ export async function startScanner(
   }, CONFIG.scanIntervalMs);
 
   log.info("INFO", {
-    message: "Scanner started.",
+    message: "Scanner started (dump-detect mode).",
     knownMarketCount: knownMarkets.size,
     heartbeatIntervalMs: CONFIG.scanIntervalMs,
+    dump: {
+      lookbackSeconds: CONFIG.dumpLookbackSeconds,
+      thresholdPercent: CONFIG.dumpThresholdPercent,
+      entryMaxPrice: CONFIG.dumpEntryMaxPrice,
+    },
     rules: {
-      "5m":      { enabled: CONFIG.enable5m,       maxTimeRemaining: CONFIG.maxTimeRemaining5m,  priceRange: [CONFIG.priceRangeMin5m,  CONFIG.priceRangeMax5m]  },
-      "15m":     { enabled: CONFIG.enable15m,      maxTimeRemaining: CONFIG.maxTimeRemaining15m, priceRange: [CONFIG.priceRangeMin15m, CONFIG.priceRangeMax15m] },
-      "fallback":{ enabled: CONFIG.enableFallback, timeRemaining5m: CONFIG.fallbackTimeRemaining5m, timeRemaining15m: CONFIG.fallbackTimeRemaining15m, minPrice: CONFIG.fallbackMinPrice, maxPrice: CONFIG.fallbackMaxPrice },
+      "5m":  { enabled: CONFIG.enable5m,  maxTimeRemaining: CONFIG.maxTimeRemaining5m },
+      "15m": { enabled: CONFIG.enable15m, maxTimeRemaining: CONFIG.maxTimeRemaining15m },
     },
   });
 }
@@ -103,6 +124,12 @@ export function isPausedState(): boolean { return isPaused; }
 
 export function trackMarket(id: string): void { trackedMarketIds.add(id); }
 export function untrackMarket(id: string): void { trackedMarketIds.delete(id); }
+
+export function getKnownMarketPrice(marketId: string): { yesPrice: number; noPrice: number } | null {
+  const market = knownMarkets.get(marketId);
+  if (!market) return null;
+  return { yesPrice: market.yesPrice, noPrice: market.noPrice };
+}
 
 // ─── fetch / refresh ──────────────────────────────────────────────────────────
 
@@ -132,7 +159,6 @@ async function refreshKnownMarkets(): Promise<void> {
   }
 
   const now = Date.now();
-  let newCount = 0;
   const newTokenIds: string[] = [];
 
   for (const market of markets) {
@@ -141,7 +167,6 @@ async function refreshKnownMarkets(): Promise<void> {
       tokenToMarket.set(market.yesTokenId, market.id);
       tokenToMarket.set(market.noTokenId, market.id);
       newTokenIds.push(market.yesTokenId, market.noTokenId);
-      newCount++;
     } else {
       knownMarkets.set(market.id, market);
     }
@@ -155,63 +180,67 @@ async function refreshKnownMarkets(): Promise<void> {
       tokenToMarket.delete(market.noTokenId);
       unsubscribeTokenIds([market.yesTokenId, market.noTokenId]);
       trackedMarketIds.delete(id);
+      priceHistory.delete(market.yesTokenId);
+      priceHistory.delete(market.noTokenId);
     }
   }
 
   if (newTokenIds.length > 0) {
     if (!wsConnected) {
-      connectWebSocket(newTokenIds, { onPriceUpdate: handlePriceUpdate, onMarketResolved: handleWsMarketResolved, onNewMarket: handleWsNewMarket });
+      connectWebSocket(newTokenIds, {
+        onPriceUpdate: handleWsPriceUpdate,
+        onMarketResolved: handleWsMarketResolved,
+        onNewMarket: handleWsNewMarket,
+      });
       wsConnected = true;
     } else {
       subscribeTokenIds(newTokenIds);
     }
   }
 
-  log.info("SCAN_TICK", { source: "heartbeat", totalKnown: knownMarkets.size, newlyAdded: newCount });
-
-  for (const market of knownMarkets.values()) {
-    evaluateAndFire(market, market.winSidePrice, "heartbeat");
-  }
+  log.info("SCAN_TICK", { source: "heartbeat", totalKnown: knownMarkets.size });
 }
 
 // ─── WebSocket callbacks ──────────────────────────────────────────────────────
 
-function handlePriceUpdate(tokenId: string, price: TokenPrice): void {
+function handleWsPriceUpdate(tokenId: string, price: TokenPrice): void {
   const marketId = tokenToMarket.get(tokenId);
   if (!marketId) return;
   const market = knownMarkets.get(marketId);
   if (!market) return;
 
+  const now = Date.now();
+  const currentAsk = price.bestAsk;
+
+  // Record price history
+  recordPrice(tokenId, now, currentAsk);
+
+  // Update market prices
   const otherTokenId = tokenId === market.yesTokenId ? market.noTokenId : market.yesTokenId;
   const otherPrice = getTokenPrice(otherTokenId);
-  const otherAsk = otherPrice?.bestAsk ?? 0;
-  const thisAsk = price.bestAsk;
+  const otherAsk = otherPrice?.bestAsk ?? (tokenId === market.yesTokenId ? market.noPrice : market.yesPrice);
 
-  let winSide: "YES" | "NO";
-  let winSidePrice: number;
-  let tokenIdToBuy: string;
-
-  if (thisAsk >= otherAsk) {
-    winSide = tokenId === market.yesTokenId ? "YES" : "NO";
-    winSidePrice = thisAsk;
-    tokenIdToBuy = tokenId;
-  } else {
-    winSide = tokenId === market.yesTokenId ? "NO" : "YES";
-    winSidePrice = otherAsk;
-    tokenIdToBuy = otherTokenId;
-  }
+  const yesPrice = tokenId === market.yesTokenId ? currentAsk : otherAsk;
+  const noPrice = tokenId === market.noTokenId ? currentAsk : otherAsk;
 
   const updatedMarket: Market = {
     ...market,
-    winSide,
-    winSidePrice: round4(winSidePrice),
-    tokenIdToBuy,
+    yesPrice: round4(yesPrice),
+    noPrice: round4(noPrice),
     tickSize: price.tickSize,
-    timeRemainingSeconds: Math.max(0, Math.floor((new Date(market.closesAt).getTime() - Date.now()) / 1000)),
+    timeRemainingSeconds: Math.max(0, Math.floor((new Date(market.closesAt).getTime() - now) / 1000)),
   };
 
   knownMarkets.set(marketId, updatedMarket);
-  evaluateAndFire(updatedMarket, winSidePrice, "websocket");
+
+  // ── Dispatch ──────────────────────────────────────────────────────────────
+  if (trackedMarketIds.has(marketId)) {
+    // Tracked: forward price to trader for DCA / stop-loss monitoring
+    onPriceUpdateCb?.(marketId, yesPrice, noPrice);
+  } else if (!isPaused) {
+    // Untracked: check for dump on this token
+    checkForDumpAndFire(updatedMarket, tokenId, currentAsk);
+  }
 }
 
 function handleWsMarketResolved(event: ResolvedMarketEvent): void {
@@ -224,6 +253,8 @@ function handleWsMarketResolved(event: ResolvedMarketEvent): void {
     tokenToMarket.delete(market.yesTokenId);
     tokenToMarket.delete(market.noTokenId);
     unsubscribeTokenIds([market.yesTokenId, market.noTokenId]);
+    priceHistory.delete(market.yesTokenId);
+    priceHistory.delete(market.noTokenId);
   }
   trackedMarketIds.delete(event.marketId);
 }
@@ -237,76 +268,83 @@ async function handleWsNewMarket(event: NewMarketEvent): Promise<void> {
   await refreshKnownMarkets();
 }
 
-// ─── qualifying logic ─────────────────────────────────────────────────────────
+// ─── dump detection ───────────────────────────────────────────────────────────
 
-/**
- * Evaluate a market against all enabled rules.
- * Returns the first matching rule, or null if none qualify.
- *
- * Rule priority: 5m → 15m → fallback
- */
-function getMatchingRule(market: Market, price: number): BetRule | null {
-  const t = market.timeRemainingSeconds;
-  if (t <= 0) return null;
-
-  // 5m rule
-  if (market.duration === "5m" && CONFIG.enable5m) {
-    if (
-      t <= CONFIG.maxTimeRemaining5m &&
-      price >= CONFIG.priceRangeMin5m &&
-      price <= CONFIG.priceRangeMax5m
-    ) return "5m";
+function recordPrice(tokenId: string, now: number, ask: number): void {
+  let history = priceHistory.get(tokenId);
+  if (!history) {
+    history = [];
+    priceHistory.set(tokenId, history);
   }
+  history.push({ timestamp: now, ask });
 
-  // 15m rule
-  if (market.duration === "15m" && CONFIG.enable15m) {
-    if (
-      t <= CONFIG.maxTimeRemaining15m &&
-      price >= CONFIG.priceRangeMin15m &&
-      price <= CONFIG.priceRangeMax15m
-    ) return "15m";
+  // Trim old entries (keep 2× lookback window for safety)
+  const cutoff = now - CONFIG.dumpLookbackSeconds * 2000;
+  while (history.length > 0 && history[0].timestamp < cutoff) {
+    history.shift();
   }
+}
 
-  // fallback rule — per-duration time threshold
-  if (CONFIG.enableFallback) {
-    const fallbackThreshold = market.duration === "15m"
-      ? CONFIG.fallbackTimeRemaining15m
-      : CONFIG.fallbackTimeRemaining5m;
-    if (t <= fallbackThreshold && price >= CONFIG.fallbackMinPrice && price <= CONFIG.fallbackMaxPrice) {
-      return "fallback";
+function checkForDump(tokenId: string, currentAsk: number): boolean {
+  const history = priceHistory.get(tokenId);
+  if (!history || history.length < 2) return false;
+
+  const now = Date.now();
+  const cutoff = now - CONFIG.dumpLookbackSeconds * 1000;
+
+  // Find the price closest to (but before) the lookback cutoff
+  let oldPrice: number | null = null;
+  for (const snap of history) {
+    if (snap.timestamp <= cutoff) {
+      oldPrice = snap.ask;
+    } else {
+      break;
     }
   }
 
-  return null;
+  if (oldPrice === null || oldPrice <= 0) return false;
+
+  const dropPercent = ((oldPrice - currentAsk) / oldPrice) * 100;
+  return dropPercent >= CONFIG.dumpThresholdPercent;
 }
 
-function evaluateAndFire(market: Market, price: number, source: string): void {
-  if (isPaused) return;
-  if (trackedMarketIds.has(market.id)) return;
+function checkForDumpAndFire(market: Market, tokenId: string, currentAsk: number): void {
+  // Entry guards
+  if (currentAsk > CONFIG.dumpEntryMaxPrice) return;
+  if (market.timeRemainingSeconds <= 0) return;
 
-  const rule = getMatchingRule(market, price);
+  // Determine BetRule from market duration
+  const rule = getMatchingRule(market);
   if (!rule) return;
 
-  // Mark the market as tracked synchronously before firing the callback.
-  // The callback is async and yields on its first await, so without this
-  // a second evaluateAndFire for the same market (same heartbeat pass or
-  // a concurrent WS price update) would pass the trackedMarketIds check
-  // above and fire a duplicate bet.
+  // Check dump
+  if (!checkForDump(tokenId, currentAsk)) return;
+
+  const dumpedSide: "YES" | "NO" = tokenId === market.yesTokenId ? "YES" : "NO";
+  const oppositeTokenId = dumpedSide === "YES" ? market.noTokenId : market.yesTokenId;
+  const otherPrice = getTokenPrice(oppositeTokenId);
+  const oppositeAsk = otherPrice?.bestAsk ?? (dumpedSide === "YES" ? market.noPrice : market.yesPrice);
+
+  // Track immediately to prevent duplicate fires
   trackedMarketIds.add(market.id);
 
-  log.info("MARKET_FOUND", {
-    source,
-    marketId: market.id,
-    question: market.question,
-    asset: market.asset,
-    duration: market.duration,
-    winSide: market.winSide,
-    winSidePrice: market.winSidePrice,
-    timeRemainingSeconds: market.timeRemainingSeconds,
-    rule,
+  log.info("DUMP_DETECTED", {
+    marketId: market.id, asset: market.asset, duration: market.duration,
+    dumpedSide, dumpAsk: currentAsk, oppositeAsk,
+    timeRemainingSeconds: market.timeRemainingSeconds, rule,
   });
 
-  onMarketFoundCb?.(market, rule);
+  onDumpDetectedCb?.(market, dumpedSide, currentAsk, oppositeAsk, rule);
+}
+
+function getMatchingRule(market: Market): BetRule | null {
+  const t = market.timeRemainingSeconds;
+  if (t <= 0) return null;
+
+  if (market.duration === "5m" && CONFIG.enable5m && t <= CONFIG.maxTimeRemaining5m) return "5m";
+  if (market.duration === "15m" && CONFIG.enable15m && t <= CONFIG.maxTimeRemaining15m) return "15m";
+
+  return null;
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
