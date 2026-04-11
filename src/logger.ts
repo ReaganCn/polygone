@@ -27,6 +27,8 @@ export type LogEvent =
   | "STRADDLE_ENTRY_START"
   | "STRADDLE_FULLY_HEDGED"
   | "STRADDLE_SKIPPED_NO_SLOT"
+  | "STRADDLE_SKIPPED_NO_EDGE"
+  | "STRADDLE_SKIPPED_MIN_SIZE"
   | "LEG1_FILLED"
   | "LEG1_FAILED"
   | "LEG2_FOK_FAILED"
@@ -60,6 +62,9 @@ export type LogEvent =
   | "REDEEM_RPC_POLLING_RETRY"
   // Shadow mode → trades log
   | "SHADOW_STRADDLE_CREATED"
+  | "SHADOW_LEG1_REJECTED"
+  | "SHADOW_LEG2_REJECTED"
+  | "SHADOW_BOOK_FETCH_FAILED"
   | "SHADOW_RESOLUTION"
   // Slot management → trades log
   | "SLOT_ASSIGNED"

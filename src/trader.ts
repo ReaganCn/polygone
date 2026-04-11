@@ -25,7 +25,7 @@ import {
   recordLoss,
 } from "./slots.js";
 import { trackMarket, untrackMarket } from "./scanner.js";
-import { createShadowStraddle } from "./shadow.js";
+import { simulateShadowStraddle } from "./shadow.js";
 import { enqueueRedemption } from "./redemptionQueue.js";
 import type { Market, StraddlePosition, Leg, BetRule } from "./types.js";
 
@@ -60,6 +60,19 @@ export async function handleDumpDetected(
     return;
   }
 
+  // ── Defensive sum check ────────────────────────────────────────────────────
+  // Reject if prices sum >= 1.0 (no straddle edge exists)
+  const priceSum = dumpAsk + oppositeAsk;
+  if (priceSum >= 1.0) {
+    log.warn("STRADDLE_SKIPPED_NO_EDGE", {
+      marketId: market.id, asset: market.asset,
+      dumpAsk, oppositeAsk, priceSum,
+      reason: `price sum ${priceSum.toFixed(4)} >= 1.0 — no edge`,
+    });
+    return;
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
+
   reserveSlot(slot.id);
   trackMarket(market.id);
 
@@ -79,6 +92,21 @@ export async function handleDumpDetected(
   // Build leg descriptors
   const targetShares = stakeUsd / dumpAsk;
   const leg2LimitPrice = Math.max(0.01, CONFIG.sumTarget - dumpAsk);
+
+  // ── Minimum size guard ───────────────────────────────────────────────────────
+  // Polymarket enforces a minimum of 5 shares per order.
+  // If targetShares < 5, both legs would be rejected — abort before placing either.
+  const POLY_MIN_SHARES = 5;
+  if (targetShares < POLY_MIN_SHARES) {
+    log.warn("STRADDLE_SKIPPED_MIN_SIZE", {
+      slotId: slot.id, marketId: market.id,
+      targetShares, stakeUsd, dumpAsk,
+      reason: `shares (${targetShares.toFixed(4)}) below Polymarket minimum of ${POLY_MIN_SHARES}`,
+    });
+    releaseSlot(slot.id);
+    return;
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
 
   const leg1: Leg = {
     side: dumpedSide,
@@ -100,9 +128,14 @@ export async function handleDumpDetected(
 
   // ── Shadow mode ─────────────────────────────────────────────────────────────
   if (CONFIG.shadowMode) {
-    const straddle = createShadowStraddle(
-      market, slot.id, stakeUsd, rule, leg1, leg2, "both_fok", hedgeDeadline,
+    const straddle = await simulateShadowStraddle(
+      market, slot.id, stakeUsd, rule, leg1, leg2, hedgeDeadline,
     );
+    if (!straddle) {
+      // Leg 1 FOK was rejected by the simulated order book — abort cleanly
+      releaseSlot(slot.id);
+      return;
+    }
     activeStraddlesByMarketId.set(market.id, straddle);
     assignStraddle(slot.id, straddle);
     startFallbackResolutionWatcher(straddle);
@@ -121,7 +154,6 @@ export async function handleDumpDetected(
       slotId: slot.id, marketId: market.id, error: leg1Result.error,
     });
     releaseSlot(slot.id);
-    untrackMarket(market.id);
     return;
   }
 

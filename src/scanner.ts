@@ -327,6 +327,10 @@ function checkForDumpAndFire(market: Market, tokenId: string, currentAsk: number
   const otherPrice = getTokenPrice(oppositeTokenId);
   const oppositeAsk = otherPrice?.bestAsk ?? (dumpedSide === "YES" ? market.noPrice : market.yesPrice);
 
+  // No straddle edge if the prices sum to >= 1.0
+  const priceSum = currentAsk + oppositeAsk;
+  if (priceSum >= 1.0) return;
+
   // Track immediately to prevent duplicate fires
   trackedMarketIds.add(market.id);
 

@@ -511,3 +511,24 @@ function roundSizeForPrecision(rawSize: number, price: number): number {
 function round4(n: number): number {
   return Math.round(n * 10000) / 10000;
 }
+
+// ─── order book fetch (used by shadow simulation) ─────────────────────────────
+
+export interface OrderBookLevel {
+  price: number;
+  size: number;
+}
+
+/**
+ * Fetch the ask side of the live order book for a token.
+ * Returns levels sorted best-ask-first (lowest price first).
+ */
+export async function fetchOrderBook(tokenId: string): Promise<OrderBookLevel[]> {
+  const client = getClobClient();
+  const book = await client.getOrderBook(tokenId) as Record<string, unknown>;
+  const asks = (book["asks"] ?? []) as Array<{ price: string; size: string }>;
+  return asks
+    .map((a) => ({ price: parseFloat(a.price), size: parseFloat(a.size) }))
+    .filter((a) => a.price > 0 && a.size > 0)
+    .sort((a, b) => a.price - b.price);
+}
