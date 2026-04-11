@@ -134,7 +134,7 @@ export function startApiServer(): void {
           "scanIntervalMs",
           "enable5m", "enable15m",
           "maxTimeRemaining5m", "maxTimeRemaining15m",
-          "dumpLookbackSeconds", "dumpThresholdPercent", "dumpEntryMaxPrice",
+          "dumpLookbackSeconds", "dumpThresholdPercent", "dumpEntryMinPrice", "dumpEntryMaxPrice",
           "sumTarget", "hedgeTimeoutSeconds",
           "enableDca", "dcaThresholdPercent", "maxDcaCount",
           "fillPollIntervalMs", "stopLossRemainingSeconds",
