@@ -1,23 +1,11 @@
 /**
  * config.ts — Single source of truth for all bot configuration.
  *
- * New in this version:
- *   - Per-duration price ranges: PRICE_RANGE_MIN_5M, PRICE_RANGE_MAX_5M,
- *     PRICE_RANGE_MIN_15M, PRICE_RANGE_MAX_15M
- *   - Per-duration max time remaining: MAX_TIME_REMAINING_5M (default 150s),
- *     MAX_TIME_REMAINING_15M (default 450s) — half of each market duration.
- *     A bet is only placed when timeRemaining <= this value.
- *   - Toggle each market type on/off: ENABLE_5M, ENABLE_15M, ENABLE_FALLBACK
- *   - Fallback is now a named rule (not just a time-based filter)
- *
- * CHANGE (redeemer):
- *   Added builder program credentials: polyBuilderApiKey, polyBuilderSecret,
- *   polyBuilderPassphrase, polygonRpcUrl.
- *   These are read from env but NOT exposed via POST /config (non-mutable).
- *
- * CHANGE (scheduler):
- *   Added tradingStartTime, tradingEndTime ("HH:MM" UTC format).
- *   Added dailyProfitTarget, dailyLossLimit (USDC, null = disabled).
+ * STRADDLE OVERHAUL:
+ *   - Removed: enableFallback, priceRange*, fallback* fields
+ *   - Added: dump detection, straddle entry, DCA, compounding config
+ *   - sumTarget defaults to 0.92 to absorb ~1.8% taker fees
+ *   - MutableConfigKeys updated accordingly
  */
 
 import "dotenv/config";
@@ -71,12 +59,11 @@ export interface BotConfig {
   polySecret: string;
   polyPassphrase: string;
 
-  // ── Builder program credentials (required for auto-redemption) ─────────────
+  // Builder program credentials (required for auto-redemption)
   polyBuilderApiKey: string;
   polyBuilderSecret: string;
   polyBuilderPassphrase: string;
   polygonRpcUrl: string;
-  // ──────────────────────────────────────────────────────────────────────────
 
   // Scanning
   scanIntervalMs: number;
@@ -85,23 +72,32 @@ export interface BotConfig {
   // Market type toggles
   enable5m: boolean;
   enable15m: boolean;
-  enableFallback: boolean;
-
-  // Price ranges — per duration
-  priceRangeMin5m: number;
-  priceRangeMax5m: number;
-  priceRangeMin15m: number;
-  priceRangeMax15m: number;
 
   // Max time remaining to enter a trade (seconds) — per duration
   maxTimeRemaining5m: number;
   maxTimeRemaining15m: number;
 
-  // Fallback rule
-  fallbackTimeRemaining5m: number;
-  fallbackTimeRemaining15m: number;
-  fallbackMinPrice: number;
-  fallbackMaxPrice: number;
+  // ── Dump detection ──────────────────────────────────────────────────────────
+  dumpLookbackSeconds: number;   // rolling window for price history (default 3)
+  dumpThresholdPercent: number;  // min % drop to fire dump signal (default 15)
+  dumpEntryMaxPrice: number;     // only enter if dumped ask <= this (default 0.35)
+  // ────────────────────────────────────────────────────────────────────────────
+
+  // ── Straddle entry ──────────────────────────────────────────────────────────
+  sumTarget: number;             // leg1 + leg2 target sum (default 0.92)
+  hedgeTimeoutSeconds: number;   // max seconds to fill Leg 2 (default 120)
+  // ────────────────────────────────────────────────────────────────────────────
+
+  // ── DCA ─────────────────────────────────────────────────────────────────────
+  enableDca: boolean;            // allow DCA on Leg 1 (default true)
+  dcaThresholdPercent: number;   // Leg 1 ask must drop this % below avg (default 5)
+  maxDcaCount: number;           // max DCA buys per straddle (default 3)
+  // ────────────────────────────────────────────────────────────────────────────
+
+  // ── Fill monitoring ─────────────────────────────────────────────────────────
+  fillPollIntervalMs: number;    // base poll interval for fill checks (default 5000)
+  stopLossRemainingSeconds: number; // force-buy Leg 2 when market closes within this (default 300)
+  // ────────────────────────────────────────────────────────────────────────────
 
   // Order execution
   orderType: OrderTypeOption;
@@ -110,6 +106,7 @@ export interface BotConfig {
   numSlots: number;
   slotInitialUsd: number;
   slotProfitMultiplier: number;
+  enableCompounding: boolean;
 
   // Mode
   shadowMode: boolean;
@@ -123,23 +120,15 @@ export interface BotConfig {
   // Express API port
   apiPort: number;
 
-  // ── Scheduler ─────────────────────────────────────────────────────────────
-  // Trading hours in UTC. Format: "HH:MM". Bot pauses outside this window.
-  // Defaults to all day ("00:00" – "23:59").
+  // Scheduler
   tradingStartTime: string;
   tradingEndTime: string;
-
-  // Daily P&L thresholds in USDC. null = disabled.
-  //   dailyProfitTarget: pause when today's net P&L >= this value.
-  //   dailyLossLimit:    pause when today's net P&L <= -this value (stored positive).
   dailyProfitTarget: number | null;
   dailyLossLimit: number | null;
-  // ──────────────────────────────────────────────────────────────────────────
 
-  // ── Telegram alerts ─────────────────────────────────────────────────────
+  // Telegram alerts
   telegramBotToken: string;
   telegramChatId: string;
-  // ──────────────────────────────────────────────────────────────────────────
 }
 
 function loadConfig(): BotConfig {
@@ -165,28 +154,32 @@ function loadConfig(): BotConfig {
     scanIntervalMs: parseInt_("SCAN_INTERVAL_MS", 4000),
     targetAssets: parseList("TARGET_ASSETS", ["BTC", "ETH", "SOL"]),
 
-    enable5m:       parseBool("ENABLE_5M", true),
-    enable15m:      parseBool("ENABLE_15M", true),
-    enableFallback: parseBool("ENABLE_FALLBACK", true),
-
-    priceRangeMin5m:  parseFloat_("PRICE_RANGE_MIN_5M",  0.91),
-    priceRangeMax5m:  parseFloat_("PRICE_RANGE_MAX_5M",  0.99),
-    priceRangeMin15m: parseFloat_("PRICE_RANGE_MIN_15M", 0.96),
-    priceRangeMax15m: parseFloat_("PRICE_RANGE_MAX_15M", 0.99),
+    enable5m:  parseBool("ENABLE_5M", true),
+    enable15m: parseBool("ENABLE_15M", true),
 
     maxTimeRemaining5m:  parseInt_("MAX_TIME_REMAINING_5M",  150),
     maxTimeRemaining15m: parseInt_("MAX_TIME_REMAINING_15M", 450),
 
-    fallbackTimeRemaining5m:  parseInt_("FALLBACK_TIME_REMAINING_5M",  40),
-    fallbackTimeRemaining15m: parseInt_("FALLBACK_TIME_REMAINING_15M", 120),
-    fallbackMinPrice:         parseFloat_("FALLBACK_MIN_PRICE", 0.0),
-    fallbackMaxPrice:         parseFloat_("FALLBACK_MAX_PRICE", 0.99),
+    dumpLookbackSeconds:  parseInt_("DUMP_LOOKBACK_SECONDS", 3),
+    dumpThresholdPercent: parseFloat_("DUMP_THRESHOLD_PERCENT", 15),
+    dumpEntryMaxPrice:    parseFloat_("DUMP_ENTRY_MAX_PRICE", 0.35),
+
+    sumTarget:            parseFloat_("SUM_TARGET", 0.92),
+    hedgeTimeoutSeconds:  parseInt_("HEDGE_TIMEOUT_SECONDS", 120),
+
+    enableDca:            parseBool("ENABLE_DCA", true),
+    dcaThresholdPercent:  parseFloat_("DCA_THRESHOLD_PERCENT", 5),
+    maxDcaCount:          parseInt_("MAX_DCA_COUNT", 3),
+
+    fillPollIntervalMs:        parseInt_("FILL_POLL_INTERVAL_MS", 5000),
+    stopLossRemainingSeconds:  parseInt_("STOP_LOSS_REMAINING_SECONDS", 300),
 
     orderType: orderTypeRaw as OrderTypeOption,
 
     numSlots:             parseInt_("NUM_SLOTS", 5),
     slotInitialUsd:       parseFloat_("SLOT_INITIAL_USD", 1),
     slotProfitMultiplier: parseFloat_("SLOT_PROFIT_MULTIPLIER", 1.2),
+    enableCompounding:    parseBool("ENABLE_COMPOUNDING", true),
 
     shadowMode: parseBool("SHADOW_MODE", true),
 
@@ -213,21 +206,23 @@ export type MutableConfigKeys =
   | "scanIntervalMs"
   | "enable5m"
   | "enable15m"
-  | "enableFallback"
-  | "priceRangeMin5m"
-  | "priceRangeMax5m"
-  | "priceRangeMin15m"
-  | "priceRangeMax15m"
   | "maxTimeRemaining5m"
   | "maxTimeRemaining15m"
-  | "fallbackTimeRemaining5m"
-  | "fallbackTimeRemaining15m"
-  | "fallbackMinPrice"
-  | "fallbackMaxPrice"
+  | "dumpLookbackSeconds"
+  | "dumpThresholdPercent"
+  | "dumpEntryMaxPrice"
+  | "sumTarget"
+  | "hedgeTimeoutSeconds"
+  | "enableDca"
+  | "dcaThresholdPercent"
+  | "maxDcaCount"
+  | "fillPollIntervalMs"
+  | "stopLossRemainingSeconds"
   | "orderType"
   | "numSlots"
   | "slotInitialUsd"
   | "slotProfitMultiplier"
+  | "enableCompounding"
   | "shadowMode"
   | "targetAssets"
   | "tradingStartTime"
@@ -236,30 +231,32 @@ export type MutableConfigKeys =
   | "dailyLossLimit";
 
 const KEY_TYPES: Record<MutableConfigKeys, "number" | "integer" | "boolean" | "string" | "stringArray" | "orderType" | "numberOrNull"> = {
-  scanIntervalMs:           "integer",
-  enable5m:                 "boolean",
-  enable15m:                "boolean",
-  enableFallback:           "boolean",
-  priceRangeMin5m:          "number",
-  priceRangeMax5m:          "number",
-  priceRangeMin15m:         "number",
-  priceRangeMax15m:         "number",
-  maxTimeRemaining5m:       "integer",
-  maxTimeRemaining15m:      "integer",
-  fallbackTimeRemaining5m:  "integer",
-  fallbackTimeRemaining15m: "integer",
-  fallbackMinPrice:         "number",
-  fallbackMaxPrice:         "number",
-  orderType:                "orderType",
-  numSlots:                 "integer",
-  slotInitialUsd:           "number",
-  slotProfitMultiplier:     "number",
-  shadowMode:               "boolean",
-  targetAssets:             "stringArray",
-  tradingStartTime:         "string",
-  tradingEndTime:           "string",
-  dailyProfitTarget:        "numberOrNull",
-  dailyLossLimit:           "numberOrNull",
+  scanIntervalMs:            "integer",
+  enable5m:                  "boolean",
+  enable15m:                 "boolean",
+  maxTimeRemaining5m:        "integer",
+  maxTimeRemaining15m:       "integer",
+  dumpLookbackSeconds:       "integer",
+  dumpThresholdPercent:      "number",
+  dumpEntryMaxPrice:         "number",
+  sumTarget:                 "number",
+  hedgeTimeoutSeconds:       "integer",
+  enableDca:                 "boolean",
+  dcaThresholdPercent:       "number",
+  maxDcaCount:               "integer",
+  fillPollIntervalMs:        "integer",
+  stopLossRemainingSeconds:  "integer",
+  orderType:                 "orderType",
+  numSlots:                  "integer",
+  slotInitialUsd:            "number",
+  slotProfitMultiplier:      "number",
+  enableCompounding:         "boolean",
+  shadowMode:                "boolean",
+  targetAssets:              "stringArray",
+  tradingStartTime:          "string",
+  tradingEndTime:            "string",
+  dailyProfitTarget:         "numberOrNull",
+  dailyLossLimit:            "numberOrNull",
 };
 
 export const CONFIG: BotConfig = loadConfig();
@@ -307,7 +304,7 @@ export function updateConfig(
           if (Array.isArray(raw)) {
             coerced = (raw as unknown[]).map(String).filter(Boolean);
           } else if (typeof raw === "string") {
-            coerced = raw.split(",").map((s) => s.trim()).filter(Boolean);
+            coerced = raw.split(",").map((s: string) => s.trim()).filter(Boolean);
           } else {
             throw new Error("must be an array or comma-separated string");
           }
