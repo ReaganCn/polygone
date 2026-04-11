@@ -95,6 +95,7 @@ export async function startScanner(
     dump: {
       lookbackSeconds: CONFIG.dumpLookbackSeconds,
       thresholdPercent: CONFIG.dumpThresholdPercent,
+      entryMinPrice: CONFIG.dumpEntryMinPrice,
       entryMaxPrice: CONFIG.dumpEntryMaxPrice,
     },
     rules: {
@@ -310,6 +311,7 @@ function checkForDump(tokenId: string, currentAsk: number): boolean {
 
 function checkForDumpAndFire(market: Market, tokenId: string, currentAsk: number): void {
   // Entry guards
+  if (currentAsk < CONFIG.dumpEntryMinPrice) return;
   if (currentAsk > CONFIG.dumpEntryMaxPrice) return;
   if (market.timeRemainingSeconds <= 0) return;
 
