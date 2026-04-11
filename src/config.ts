@@ -80,6 +80,7 @@ export interface BotConfig {
   // ── Dump detection ──────────────────────────────────────────────────────────
   dumpLookbackSeconds: number;   // rolling window for price history (default 3)
   dumpThresholdPercent: number;  // min % drop to fire dump signal (default 15)
+  dumpEntryMinPrice: number;     // only enter if dumped ask >= this (default 0.05)
   dumpEntryMaxPrice: number;     // only enter if dumped ask <= this (default 0.35)
   // ────────────────────────────────────────────────────────────────────────────
 
@@ -162,6 +163,7 @@ function loadConfig(): BotConfig {
 
     dumpLookbackSeconds:  parseInt_("DUMP_LOOKBACK_SECONDS", 3),
     dumpThresholdPercent: parseFloat_("DUMP_THRESHOLD_PERCENT", 15),
+    dumpEntryMinPrice:    parseFloat_("DUMP_ENTRY_MIN_PRICE", 0.05),
     dumpEntryMaxPrice:    parseFloat_("DUMP_ENTRY_MAX_PRICE", 0.35),
 
     sumTarget:            parseFloat_("SUM_TARGET", 0.92),
@@ -210,6 +212,7 @@ export type MutableConfigKeys =
   | "maxTimeRemaining15m"
   | "dumpLookbackSeconds"
   | "dumpThresholdPercent"
+  | "dumpEntryMinPrice"
   | "dumpEntryMaxPrice"
   | "sumTarget"
   | "hedgeTimeoutSeconds"
@@ -238,6 +241,7 @@ const KEY_TYPES: Record<MutableConfigKeys, "number" | "integer" | "boolean" | "s
   maxTimeRemaining15m:       "integer",
   dumpLookbackSeconds:       "integer",
   dumpThresholdPercent:      "number",
+  dumpEntryMinPrice:         "number",
   dumpEntryMaxPrice:         "number",
   sumTarget:                 "number",
   hedgeTimeoutSeconds:       "integer",
