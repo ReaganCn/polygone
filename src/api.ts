@@ -18,7 +18,7 @@
 import express, { Request, Response } from "express";
 import { CONFIG, updateConfig } from "./config.js";
 import { log } from "./logger.js";
-import { getSnapshot, getActiveBets, getSummary } from "./slots.js";
+import { getSnapshot, getActiveStraddles, getSummary } from "./slots.js";
 import { pauseScanner, resumeScanner, isPausedState } from "./scanner.js";
 import { dailyState } from "./dailyState.js";
 import { getRedemptionStatus } from "./redemptionQueue.js";
@@ -38,22 +38,25 @@ export function startApiServer(): void {
     const netPnl         = round2(summary.totalProfitExtracted - summary.totalLost + unrealisedGain);
     const netPnlToday    = round2(netPnl - dailyState.startOfDayPnl);
 
-    const activeBets = getActiveBets().map((b) => ({
-      betId: b.betId,
-      slotId: b.slotId,
-      marketId: b.market.id,
-      question: b.market.question,
-      asset: b.market.asset,
-      duration: b.market.duration,
-      side: b.side,
-      stakeUsd: b.stakeUsd,
-      expectedPayoutUsd: b.expectedPayoutUsd,
-      priceAtBet: b.priceAtBet,
-      placedAt: b.placedAt,
-      closesAt: b.market.closesAt,
-      orderId: b.orderId,
-      shadow: b.shadow,
-      rule: b.rule,
+    const activeStraddles = getActiveStraddles().map((s) => ({
+      id: s.id,
+      slotId: s.slotId,
+      marketId: s.market.id,
+      question: s.market.question,
+      asset: s.market.asset,
+      duration: s.market.duration,
+      rule: s.rule,
+      stakeUsd: s.stakeUsd,
+      status: s.status,
+      entryMode: s.entryMode,
+      leg1: { side: s.leg1.side, price: s.leg1.fillPrice, status: s.leg1.status },
+      leg2: { side: s.leg2.side, price: s.leg2.fillPrice ?? s.leg2.limitPrice, status: s.leg2.status },
+      dcaCount: s.dcaEntries.length,
+      totalLeg1Shares: s.totalLeg1Shares,
+      weightedAvgLeg1Price: s.weightedAvgLeg1Price,
+      shadow: s.shadow,
+      createdAt: s.createdAt,
+      closesAt: s.market.closesAt,
     }));
 
     res.json({
@@ -97,7 +100,7 @@ export function startApiServer(): void {
       },
 
       slots: snapshot,
-      activeBets,
+      activeStraddles,
     });
   });
 
@@ -129,14 +132,14 @@ export function startApiServer(): void {
         error: "No recognised mutable config keys in body.",
         mutableKeys: [
           "scanIntervalMs",
-          "enable5m", "enable15m", "enableFallback",
-          "priceRangeMin5m", "priceRangeMax5m",
-          "priceRangeMin15m", "priceRangeMax15m",
+          "enable5m", "enable15m",
           "maxTimeRemaining5m", "maxTimeRemaining15m",
-          "fallbackTimeRemaining5m", "fallbackTimeRemaining15m",
-          "fallbackMinPrice", "fallbackMaxPrice",
+          "dumpLookbackSeconds", "dumpThresholdPercent", "dumpEntryMaxPrice",
+          "sumTarget", "hedgeTimeoutSeconds",
+          "enableDca", "dcaThresholdPercent", "maxDcaCount",
+          "fillPollIntervalMs", "stopLossRemainingSeconds",
           "orderType",
-          "numSlots", "slotInitialUsd", "slotProfitMultiplier",
+          "numSlots", "slotInitialUsd", "slotProfitMultiplier", "enableCompounding",
           "shadowMode", "targetAssets",
           "tradingStartTime", "tradingEndTime",
           "dailyProfitTarget", "dailyLossLimit",
@@ -147,7 +150,8 @@ export function startApiServer(): void {
           "set daily loss limit":      { dailyLossLimit: 20 },
           "disable daily profit cap":  { dailyProfitTarget: null },
           "disable 5m markets":        { enable5m: false },
-          "set 15m price range":       { priceRangeMin15m: 0.96, priceRangeMax15m: 0.99 },
+          "set sum target":            { sumTarget: 0.90 },
+          "set dump threshold":        { dumpThresholdPercent: 20 },
         },
       });
       return;
