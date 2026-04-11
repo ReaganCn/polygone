@@ -106,7 +106,7 @@ export function formatStatusMessage(
   lines.push("");
   lines.push("--- BY RULE ---");
 
-  for (const rule of ["5m", "15m", "fallback"] as BetRule[]) {
+  for (const rule of ["5m", "15m"] as BetRule[]) {
     const r = summary.byRule[rule];
     if (r.totalTrades === 0) {
       lines.push(`  ${rule.padEnd(10)} no trades`);
