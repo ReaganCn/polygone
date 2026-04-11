@@ -24,25 +24,28 @@ import { initialiseSlots, getSummary, resetSlots } from "./slots.js";
 import { initialiseClobClient } from "./polymarket.js";
 import { startScanner, stopScanner, pauseScanner, resumeScanner, isPausedState } from "./scanner.js";
 import { startApiServer } from "./api.js";
-import { handleQualifyingMarket, handleWsResolution } from "./trader.js";
+import { handleDumpDetected, handlePriceUpdate, handleWsResolution } from "./trader.js";
 import { dailyState } from "./dailyState.js";
 import { startRedemptionQueue, stopRedemptionQueue } from "./redemptionQueue.js";
 import { sendTelegramAlert, formatStatusMessage } from "./telegram.js";
 
 async function main(): Promise<void> {
   log.info("BOT_STARTED", {
-    message: "Polymarket crypto up/down bot starting...",
+    message: "Polymarket straddle bot starting...",
     shadowMode: CONFIG.shadowMode,
     targetAssets: CONFIG.targetAssets,
-    marketDurations: CONFIG.maxTimeRemaining15m,
-    priceRange: { min: CONFIG.priceRangeMin15m, max: CONFIG.priceRangeMax15m },
-    fallback: {
-      timeRemainingS: CONFIG.fallbackTimeRemaining15m,
-      maxPrice: CONFIG.fallbackMaxPrice,
+    dump: {
+      lookbackSeconds: CONFIG.dumpLookbackSeconds,
+      thresholdPercent: CONFIG.dumpThresholdPercent,
+      entryMaxPrice: CONFIG.dumpEntryMaxPrice,
+    },
+    straddle: {
+      sumTarget: CONFIG.sumTarget,
+      hedgeTimeoutSeconds: CONFIG.hedgeTimeoutSeconds,
     },
     numSlots: CONFIG.numSlots,
     slotInitialUsd: CONFIG.slotInitialUsd,
-    slotProfitMultiplier: CONFIG.slotProfitMultiplier,
+    enableCompounding: CONFIG.enableCompounding,
     orderType: CONFIG.orderType,
     logFile: CONFIG.logFilePath,
     tradingHours: `${CONFIG.tradingStartTime}–${CONFIG.tradingEndTime} UTC`,
@@ -86,7 +89,7 @@ async function main(): Promise<void> {
   setInterval(supervisorTick, 60_000);
 
   // 6. Start WebSocket-driven scanner (pause state already set)
-  await startScanner(handleQualifyingMarket, handleWsResolution, isPausedState());
+  await startScanner(handleDumpDetected, handlePriceUpdate, handleWsResolution, isPausedState());
 
   log.info("BOT_STARTED", {
     message: "Bot is running.",
