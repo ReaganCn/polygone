@@ -24,7 +24,7 @@ import { initialiseSlots, getSummary, resetSlots } from "./slots.js";
 import { initialiseClobClient } from "./polymarket.js";
 import { startScanner, stopScanner, pauseScanner, resumeScanner, isPausedState } from "./scanner.js";
 import { startApiServer } from "./api.js";
-import { handleQualifyingMarket, handleWsResolution } from "./trader.js";
+import { handleQualifyingMarket, handleWsResolution, initTrader } from "./trader.js";
 import { dailyState } from "./dailyState.js";
 import { startRedemptionQueue, stopRedemptionQueue } from "./redemptionQueue.js";
 import { sendTelegramAlert, formatStatusMessage } from "./telegram.js";
@@ -53,6 +53,9 @@ async function main(): Promise<void> {
 
   // 1. Initialise slots
   initialiseSlots();
+
+  // 2. Initialise trader (wires early-close price callback from scanner)
+  initTrader();
 
   // 2. Initialise CLOB client
   if (!CONFIG.shadowMode) {
