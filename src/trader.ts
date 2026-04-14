@@ -9,14 +9,27 @@
 
 import { CONFIG } from "./config.js";
 import { log } from "./logger.js";
-import { placeOrder, fetchMarketResolution } from "./polymarket.js";
+import { placeOrder, fetchMarketResolution, closePosition, getOrderStatus, cancelOrder } from "./polymarket.js";
 import { getIdleSlot, reserveSlot, releaseSlot, assignBet, recordWin, recordLoss } from "./slots.js";
-import { trackMarket, untrackMarket } from "./scanner.js";
+import { trackMarket, untrackMarket, setActiveBetPriceCallback } from "./scanner.js";
+import { getTokenPrice } from "./websocket.js";
 import { simulateBet } from "./shadow.js";
 import { enqueueRedemption } from "./redemptionQueue.js";
 import type { Market, ActiveBet, BetRule } from "./types.js";
+import type { TokenPrice } from "./websocket.js";
 
 const activeBetsByMarketId = new Map<string, ActiveBet>();
+
+/** Prevents concurrent early-close attempts for the same market. */
+const closingMarketIds = new Set<string>();
+
+/**
+ * Wire up the early-close price callback from scanner.
+ * Must be called once at startup (from index.ts) before any bets are placed.
+ */
+export function initTrader(): void {
+  setActiveBetPriceCallback(checkEarlyCloseForBet);
+}
 
 /** Clear tracking of bets that have already been resolved. Called during daily reset. */
 export function getActiveBetCount(): number {
@@ -136,6 +149,8 @@ async function handleLiveBet(
   const betId = generateBetId();
   const price = result.avgPrice ?? market.winSidePrice;
   const expectedPayoutUsd = Math.round((stakeUsd / price) * 100) / 100;
+  // Capture best bid at entry as TP/SL baseline (ask is always above bid).
+  const bidAtEntry = getTokenPrice(market.tokenIdToBuy)?.bestBid ?? price;
 
   const bet: ActiveBet = {
     betId, market, slotId, stakeUsd, expectedPayoutUsd,
@@ -144,6 +159,7 @@ async function handleLiveBet(
     shadow: false,
     side: market.winSide,
     priceAtBet: price,
+    bidPriceAtBet: bidAtEntry,
     rule,
   };
 
@@ -218,4 +234,203 @@ function normaliseOutcome(outcome: string, tokenId: string, bet: ActiveBet): "YE
   if (tokenId === bet.market.noTokenId) return "NO";
   log.warn("WARN", { message: "Unrecognised outcome — defaulting NO", outcome, tokenId });
   return "NO";
+}
+
+// ─── early close (TP / SL) ────────────────────────────────────────────────────
+
+/**
+ * Called on every WebSocket price update for a tracked (active-bet) market.
+ * Checks whether the current bid has moved enough to trigger an early close.
+ * This function is synchronous; the async close is fire-and-forgotten.
+ */
+function checkEarlyCloseForBet(marketId: string, tokenId: string, price: TokenPrice): void {
+  if (!CONFIG.earlyCloseEnabled) return;
+
+  const bet = activeBetsByMarketId.get(marketId);
+  if (!bet) return;
+
+  // Prevent concurrent triggers while a close order is already in flight.
+  if (closingMarketIds.has(marketId)) return;
+
+  // Resolve the current bid for the token we actually hold.
+  let currentBid: number;
+  if (tokenId === bet.market.tokenIdToBuy) {
+    currentBid = price.bestBid;
+  } else {
+    currentBid = getTokenPrice(bet.market.tokenIdToBuy)?.bestBid ?? 0;
+  }
+
+  if (currentBid <= 0) return;
+
+  // Thresholds are relative to the bid price at entry, not the ask.
+  // This avoids instant SL triggers caused by the natural bid-ask spread.
+  const tp = bet.bidPriceAtBet + CONFIG.earlyCloseTakeProfitDelta;
+  const sl = bet.bidPriceAtBet - CONFIG.earlyCloseStopLossDelta;
+
+  if (currentBid >= tp) {
+    handleEarlyClose(bet, "TP", currentBid).catch((err) =>
+      log.error("EARLY_CLOSE_ERROR", { betId: bet.betId, type: "TP", error: (err as Error).message })
+    );
+  } else if (currentBid <= sl) {
+    handleEarlyClose(bet, "SL", currentBid).catch((err) =>
+      log.error("EARLY_CLOSE_ERROR", { betId: bet.betId, type: "SL", error: (err as Error).message })
+    );
+  }
+}
+
+async function handleEarlyClose(bet: ActiveBet, type: "TP" | "SL", exitBid: number): Promise<void> {
+  // Synchronous guard — must happen before any await to block concurrent triggers.
+  closingMarketIds.add(bet.market.id);
+
+  const sharesOwned = bet.stakeUsd / bet.priceAtBet;
+  let proceeds = Math.round(sharesOwned * exitBid * 100) / 100;
+
+  if (!bet.shadow) {
+    // ── Live mode ──────────────────────────────────────────────────────────
+    if (CONFIG.earlyCloseOrderType === "FOK") {
+      // Retry loop: each attempt refreshes the current bid price.
+      let result: { success: boolean; avgPrice?: number; error?: string } | null = null;
+      let lastBid = exitBid;
+
+      for (let attempt = 0; attempt <= CONFIG.earlyCloseFokRetries; attempt++) {
+        if (attempt > 0) {
+          await sleep(CONFIG.earlyCloseFokRetryDelayMs);
+          // Refresh bid between retries — market may have moved.
+          lastBid = getTokenPrice(bet.market.tokenIdToBuy)?.bestBid ?? lastBid;
+        }
+
+        result = await closePosition(bet, lastBid, "FOK");
+        if (result.success) break;
+
+        log.warn("EARLY_CLOSE_FOK_RETRY", {
+          betId: bet.betId, attempt: attempt + 1,
+          maxRetries: CONFIG.earlyCloseFokRetries,
+          error: result.error,
+        });
+      }
+
+      if (!result?.success) {
+        log.warn("EARLY_CLOSE_EXHAUSTED", {
+          betId: bet.betId, marketId: bet.market.id, type,
+          message: "All FOK retries exhausted — letting market resolve naturally.",
+        });
+        closingMarketIds.delete(bet.market.id);
+        return;
+      }
+
+      proceeds = Math.round(sharesOwned * (result.avgPrice ?? lastBid) * 100) / 100;
+
+    } else {
+      // LIMIT (GTC) path
+      const result = await closePosition(bet, exitBid, "LIMIT");
+
+      if (!result.success || !result.orderId) {
+        log.warn("EARLY_CLOSE_FAILED", {
+          betId: bet.betId, marketId: bet.market.id, type,
+          error: result.error ?? "No orderId returned",
+          message: "Limit close order failed — letting market resolve naturally.",
+        });
+        closingMarketIds.delete(bet.market.id);
+        return;
+      }
+
+      const fillProceeds = await pollLimitCloseOrder(
+        bet, result.orderId, sharesOwned, exitBid
+      );
+
+      if (fillProceeds === null) {
+        // Market expired before fill; natural resolution will handle it.
+        closingMarketIds.delete(bet.market.id);
+        return;
+      }
+
+      proceeds = fillProceeds;
+    }
+  }
+  // In shadow mode: proceeds already computed from exitBid above — no API call.
+
+  // ── Record outcome ─────────────────────────────────────────────────────────
+  const pnlUsd = Math.round((proceeds - bet.stakeUsd) * 100) / 100;
+
+  if (proceeds >= bet.stakeUsd) {
+    recordWin(bet.slotId, proceeds);
+  } else {
+    // Only the actual loss (stake - proceeds) is recorded, not the full stake.
+    recordLoss(bet.slotId, bet.stakeUsd - proceeds);
+  }
+
+  // ── Cleanup ────────────────────────────────────────────────────────────────
+  activeBetsByMarketId.delete(bet.market.id);
+  // Do NOT call untrackMarket here. Keeping the market in trackedMarketIds
+  // prevents the scanner from immediately firing a new bet on the same market
+  // (the slot just freed up). The scanner prunes it from knownMarkets ~30s
+  // after closesAt, which also cleans it from trackedMarketIds.
+  closingMarketIds.delete(bet.market.id);
+
+  const configuredDelta = type === "TP"
+    ? CONFIG.earlyCloseTakeProfitDelta
+    : CONFIG.earlyCloseStopLossDelta;
+  const logKey = type === "TP" ? "EARLY_CLOSE_TP" : "EARLY_CLOSE_SL";
+  log.info(logKey, {
+    betId: bet.betId, marketId: bet.market.id,
+    question: bet.market.question,
+    asset: bet.market.asset, side: bet.side, rule: bet.rule,
+    bidPriceAtBet: bet.bidPriceAtBet, priceAtBet: bet.priceAtBet, exitBid,
+    configuredDelta, threshold: Math.round((bet.bidPriceAtBet + (type === "TP" ? configuredDelta : -configuredDelta)) * 1000) / 1000,
+    stakeUsd: bet.stakeUsd, proceeds, pnlUsd,
+    orderType: CONFIG.earlyCloseOrderType, shadow: bet.shadow,
+  });
+}
+
+/**
+ * Poll a resting GTC close order until it fills or the market is about to expire.
+ * Returns the fill proceeds in USDC, or null if the order was cancelled due to expiry.
+ */
+async function pollLimitCloseOrder(
+  bet: ActiveBet,
+  orderId: string,
+  sharesOwned: number,
+  limitPrice: number,
+): Promise<number | null> {
+  const POLL_INTERVAL_MS = 2_000;
+  // Cancel and hand off to natural resolution 5 seconds before market closes.
+  const cutoffMs = new Date(bet.market.closesAt).getTime() - 5_000;
+
+  while (Date.now() < cutoffMs) {
+    await sleep(POLL_INTERVAL_MS);
+
+    try {
+      const status = await getOrderStatus(orderId);
+
+      if (status.filled) {
+        const avgPrice = status.avgPrice ?? limitPrice;
+        return Math.round(sharesOwned * avgPrice * 100) / 100;
+      }
+
+      // Partially filled — keep waiting for full fill.
+    } catch (err) {
+      log.warn("EARLY_CLOSE_POLL_ERROR", {
+        betId: bet.betId, orderId, error: (err as Error).message,
+      });
+    }
+  }
+
+  // Deadline reached — cancel the unfilled order so tokens don't get locked.
+  try {
+    await cancelOrder(orderId);
+    log.info("EARLY_CLOSE_LIMIT_CANCELLED", {
+      betId: bet.betId, orderId,
+      message: "Limit close order cancelled at expiry — natural resolution will handle it.",
+    });
+  } catch (err) {
+    log.warn("EARLY_CLOSE_CANCEL_ERROR", {
+      betId: bet.betId, orderId, error: (err as Error).message,
+    });
+  }
+
+  return null;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }
