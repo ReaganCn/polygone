@@ -32,7 +32,10 @@ export interface ActiveBet {
   placedAt: string;
   shadow: boolean;
   side: "YES" | "NO";
+  /** Ask price paid at entry — used for payout calculation. */
   priceAtBet: number;
+  /** Best bid recorded at entry — used as TP/SL baseline. */
+  bidPriceAtBet: number;
   /** Which qualifying rule triggered this bet */
   rule: BetRule;
 }
