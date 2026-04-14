@@ -45,8 +45,11 @@ const knownMarkets = new Map<string, Market>();
 const tokenToMarket = new Map<string, string>();
 const trackedMarketIds = new Set<string>();
 
+type ActiveBetPriceCallback = (marketId: string, tokenId: string, price: TokenPrice) => void;
+
 let onMarketFoundCb: MarketCallback | null = null;
 let onMarketResolvedCb: ResolutionCallback | null = null;
+let onActiveBetPriceUpdateCb: ActiveBetPriceCallback | null = null;
 let heartbeatHandle: ReturnType<typeof setInterval> | null = null;
 let wsConnected = false;
 let isPaused = false;
@@ -103,6 +106,15 @@ export function isPausedState(): boolean { return isPaused; }
 
 export function trackMarket(id: string): void { trackedMarketIds.add(id); }
 export function untrackMarket(id: string): void { trackedMarketIds.delete(id); }
+
+/**
+ * Register a callback that fires on every WebSocket price update for a market
+ * that is already tracked (i.e. has an active bet). Used by trader.ts to
+ * implement early close (TP / SL) without a polling loop.
+ */
+export function setActiveBetPriceCallback(cb: ActiveBetPriceCallback): void {
+  onActiveBetPriceUpdateCb = cb;
+}
 
 // ─── fetch / refresh ──────────────────────────────────────────────────────────
 
@@ -211,6 +223,13 @@ function handlePriceUpdate(tokenId: string, price: TokenPrice): void {
   };
 
   knownMarkets.set(marketId, updatedMarket);
+
+  // Notify trader of price update on markets with active bets, so it can
+  // check early-close (TP/SL) thresholds without a separate poll loop.
+  if (trackedMarketIds.has(marketId) && onActiveBetPriceUpdateCb) {
+    onActiveBetPriceUpdateCb(marketId, tokenId, price);
+  }
+
   evaluateAndFire(updatedMarket, winSidePrice, "websocket");
 }
 
