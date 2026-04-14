@@ -61,6 +61,7 @@ function parseList(key: string, fallback: string[]): string[] {
 }
 
 export type OrderTypeOption = "GTC" | "GTD" | "FOK" | "FAK";
+export type EarlyCloseOrderTypeOption = "FOK" | "LIMIT";
 
 export interface BotConfig {
   // Wallet / auth
@@ -140,6 +141,23 @@ export interface BotConfig {
   telegramBotToken: string;
   telegramChatId: string;
   // ──────────────────────────────────────────────────────────────────────────
+
+  // ── Early close (TP / SL on active bets) ─────────────────────────────────
+  // When enabled, the bot monitors the bid price of every held token via
+  // WebSocket and closes the position before market expiry.
+  earlyCloseEnabled: boolean;
+  // "FOK" = Fill-Or-Kill sell with up to earlyCloseFokRetries retries.
+  // "LIMIT" = GTC sell, waits for fill until market expires then cancels.
+  earlyCloseOrderType: EarlyCloseOrderTypeOption;
+  // Take profit: close when current bid rises by this delta above entry price.
+  earlyCloseTakeProfitDelta: number;
+  // Stop loss: close when current bid falls by this delta below entry price.
+  earlyCloseStopLossDelta: number;
+  // How many times to retry a failed FOK close (FOK mode only).
+  earlyCloseFokRetries: number;
+  // Milliseconds to wait between FOK retries (FOK mode only).
+  earlyCloseFokRetryDelayMs: number;
+  // ──────────────────────────────────────────────────────────────────────────
 }
 
 function loadConfig(): BotConfig {
@@ -204,7 +222,16 @@ function loadConfig(): BotConfig {
 
     telegramBotToken: optionalEnv("TELEGRAM_BOT_TOKEN", ""),
     telegramChatId:   optionalEnv("TELEGRAM_CHAT_ID", ""),
-  };
+    earlyCloseEnabled:          parseBool("EARLY_CLOSE_ENABLED", false),
+    earlyCloseOrderType:        (() => {
+      const v = optionalEnv("EARLY_CLOSE_ORDER_TYPE", "FOK").toUpperCase();
+      if (v !== "FOK" && v !== "LIMIT") throw new Error(`EARLY_CLOSE_ORDER_TYPE must be FOK or LIMIT, got: ${v}`);
+      return v as EarlyCloseOrderTypeOption;
+    })(),
+    earlyCloseTakeProfitDelta:  parseFloat_("EARLY_CLOSE_TP_DELTA",            0.06),
+    earlyCloseStopLossDelta:    parseFloat_("EARLY_CLOSE_SL_DELTA",            0.03),
+    earlyCloseFokRetries:       parseInt_("EARLY_CLOSE_FOK_RETRIES",           3),
+    earlyCloseFokRetryDelayMs:  parseInt_("EARLY_CLOSE_FOK_RETRY_DELAY_MS",   1000),  };
 }
 
 // ─── mutable keys ─────────────────────────────────────────────────────────────
@@ -233,9 +260,15 @@ export type MutableConfigKeys =
   | "tradingStartTime"
   | "tradingEndTime"
   | "dailyProfitTarget"
-  | "dailyLossLimit";
+  | "dailyLossLimit"
+  | "earlyCloseEnabled"
+  | "earlyCloseOrderType"
+  | "earlyCloseTakeProfitDelta"
+  | "earlyCloseStopLossDelta"
+  | "earlyCloseFokRetries"
+  | "earlyCloseFokRetryDelayMs";
 
-const KEY_TYPES: Record<MutableConfigKeys, "number" | "integer" | "boolean" | "string" | "stringArray" | "orderType" | "numberOrNull"> = {
+const KEY_TYPES: Record<MutableConfigKeys, "number" | "integer" | "boolean" | "string" | "stringArray" | "orderType" | "closeOrderType" | "numberOrNull"> = {
   scanIntervalMs:           "integer",
   enable5m:                 "boolean",
   enable15m:                "boolean",
@@ -260,6 +293,12 @@ const KEY_TYPES: Record<MutableConfigKeys, "number" | "integer" | "boolean" | "s
   tradingEndTime:           "string",
   dailyProfitTarget:        "numberOrNull",
   dailyLossLimit:           "numberOrNull",
+  earlyCloseEnabled:          "boolean",
+  earlyCloseOrderType:        "closeOrderType",
+  earlyCloseTakeProfitDelta:  "number",
+  earlyCloseStopLossDelta:    "number",
+  earlyCloseFokRetries:       "integer",
+  earlyCloseFokRetryDelayMs:  "integer",
 };
 
 export const CONFIG: BotConfig = loadConfig();
@@ -300,6 +339,12 @@ export function updateConfig(
         case "orderType": {
           const s = String(raw).toUpperCase();
           if (!["GTC", "GTD", "FOK", "FAK"].includes(s)) throw new Error("must be GTC, GTD, FOK, or FAK");
+          coerced = s;
+          break;
+        }
+        case "closeOrderType": {
+          const s = String(raw).toUpperCase();
+          if (!["FOK", "LIMIT"].includes(s)) throw new Error("must be FOK or LIMIT");
           coerced = s;
           break;
         }
