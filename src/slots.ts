@@ -264,26 +264,22 @@ export function recordWin(slotId: number, payoutUsd: number): void {
   clearSlot(slot);
 }
 
-export function recordLoss(slotId: number): void {
+export function recordLoss(slotId: number, actualLossUsd?: number): void {
   const slot = findSlot(slotId);
   const bet = slot.activeBet!;
   const balanceBefore = slot.balance;
 
-  // Only the STAKE is lost — not the full slot balance.
-  // The slot may have accumulated extra from prior wins (e.g. $1.10 balance
-  // but only $1 was staked). The $0.10 excess was never at risk.
-  // We reset balance to initialBalance: the $0.10 excess is forfeited
-  // back to the slot's base (it never got extracted), but the real cash
-  // loss is only the stake amount.
-  const stakeAtRisk = bet.stakeUsd; // = initialBalance (slot always bets its base)
+  // If actualLossUsd is provided (e.g. early close with partial loss), use it.
+  // Otherwise fall back to the full stake (natural expiry = full capital lost).
+  const loss = actualLossUsd !== undefined ? actualLossUsd : bet.stakeUsd;
   const excessForfeit = round2(Math.max(0, balanceBefore - slot.initialBalance));
 
-  slot.totalLost += stakeAtRisk;
+  slot.totalLost += loss;
   slot.losses++;
   slot.ruleStats[bet.rule].losses++;
-  slot.ruleStats[bet.rule].totalLost += stakeAtRisk;
+  slot.ruleStats[bet.rule].totalLost += loss;
 
-  // Reset balance to initial (excess compounded gain is forfeited, not "lost" externally)
+  // Reset balance to initial — excess compounded gain is forfeited back to base.
   slot.balance = slot.initialBalance;
 
   log.info("SLOT_LOSS_RESET", {
@@ -291,7 +287,7 @@ export function recordLoss(slotId: number): void {
     asset: bet.market.asset, side: bet.side, rule: bet.rule,
     stakeUsd: bet.stakeUsd,
     balanceBefore: round2(balanceBefore),
-    stakeAtRisk,
+    actualLossUsd: round2(loss),
     excessForfeit,
     balanceAfter: round2(slot.balance),
     totalLostOnSlot: round2(slot.totalLost),
