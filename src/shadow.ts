@@ -3,6 +3,7 @@
  */
 
 import { log } from "./logger.js";
+import { getTokenPrice } from "./websocket.js";
 import type { ActiveBet, Market, BetRule } from "./types.js";
 
 function generateId(): string {
@@ -14,6 +15,11 @@ export function simulateBet(market: Market, slotId: number, stakeUsd: number, ru
   const price = market.winSidePrice;
   const expectedPayoutUsd = Math.round((stakeUsd / price) * 100) / 100;
 
+  // Capture the best bid at entry as the TP/SL baseline.
+  // The ask (priceAtBet) is always higher than the bid due to spread,
+  // so deltas must be measured from the bid to be meaningful.
+  const bidAtEntry = getTokenPrice(market.tokenIdToBuy)?.bestBid ?? price;
+
   const bet: ActiveBet = {
     betId, market, slotId, stakeUsd, expectedPayoutUsd,
     orderId: undefined,
@@ -21,6 +27,7 @@ export function simulateBet(market: Market, slotId: number, stakeUsd: number, ru
     shadow: true,
     side: market.winSide,
     priceAtBet: price,
+    bidPriceAtBet: bidAtEntry,
     rule,
   };
 
