@@ -40,7 +40,7 @@ import { Wallet } from "ethers";
 import type { ApiKeyCreds } from "@polymarket/clob-client";
 import { CONFIG } from "./config.js";
 import { log } from "./logger.js";
-import type { Market, OrderResult, MarketResolution } from "./types.js";
+import type { Market, ActiveBet, OrderResult, MarketResolution } from "./types.js";
 import { createPublicClient, Hex, http } from "viem";
 import { polygon } from "viem/chains";
 
@@ -525,4 +525,122 @@ function roundSizeForPrecision(rawSize: number, price: number): number {
 
 function round4(n: number): number {
   return Math.round(n * 10000) / 10000;
+}
+
+// ─── early close: sell an active position ────────────────────────────────────
+
+/**
+ * Attempt to close (sell) an active position via a SELL order.
+ *
+ * @param bet        The active bet whose tokens we hold.
+ * @param currentBid The bid price we want to sell at.
+ * @param type       "FOK" = fill-or-kill market order.
+ *                   "LIMIT" = GTC limit order (returns orderId without waiting for fill).
+ */
+export async function closePosition(
+  bet: ActiveBet,
+  currentBid: number,
+  type: "FOK" | "LIMIT",
+): Promise<OrderResult> {
+  const client = getClobClient();
+  const tickSize = bet.market.tickSize as TickSize;
+  // Number of shares held (SELL amount must be in shares, not USDC)
+  const sharesOwned = roundSizeForPrecision(bet.stakeUsd / bet.priceAtBet, currentBid);
+
+  try {
+    let resp: unknown;
+
+    if (type === "FOK") {
+      resp = await client.createAndPostMarketOrder(
+        {
+          tokenID: bet.market.tokenIdToBuy,
+          amount: sharesOwned,
+          side: Side.SELL,
+          price: currentBid,
+        },
+        { tickSize, negRisk: bet.market.negRisk },
+        OrderType.FOK,
+      );
+    } else {
+      // LIMIT (GTC): sets a resting sell order at currentBid
+      resp = await client.createAndPostOrder(
+        {
+          tokenID: bet.market.tokenIdToBuy,
+          price:   currentBid,
+          size:    sharesOwned,
+          side:    Side.SELL,
+        },
+        { tickSize, negRisk: bet.market.negRisk },
+        OrderType.GTC,
+      );
+    }
+
+    const r = resp as Record<string, unknown>;
+    const errorMsg = r["errorMsg"] ?? r["error"];
+    const status   = r["status"] as string | undefined;
+    const orderId  = (r["orderId"] ?? r["id"] ?? r["orderID"] ?? "") as string;
+    const isRejected =
+      (typeof errorMsg === "string" && errorMsg.length > 0 && !orderId) ||
+      status === "rejected" ||
+      status === "error";
+
+    if (isRejected) {
+      const errorText = String(errorMsg ?? status ?? "Close order rejected by CLOB");
+      log.error("ORDER_CLOSE_FAILED", {
+        betId: bet.betId, marketId: bet.market.id,
+        tokenId: bet.market.tokenIdToBuy,
+        sharesOwned, currentBid, orderType: type,
+        error: errorText, rawResponse: resp,
+      });
+      return { success: false, error: errorText };
+    }
+
+    log.info("ORDER_CLOSE_RESPONSE", {
+      betId: bet.betId, marketId: bet.market.id,
+      tokenId: bet.market.tokenIdToBuy,
+      sharesOwned, currentBid,
+      estimatedProceeds: Math.round(sharesOwned * currentBid * 100) / 100,
+      orderType: type, orderId, status, rawResponse: resp,
+    });
+
+    return {
+      success: true,
+      orderId: orderId || undefined,
+      avgPrice: currentBid,
+      filled: type === "FOK",
+      rawResponse: resp,
+    };
+  } catch (err) {
+    const error = (err as Error).message;
+    log.error("ORDER_CLOSE_FAILED", { betId: bet.betId, marketId: bet.market.id, sharesOwned, currentBid, error });
+    return { success: false, error };
+  }
+}
+
+/**
+ * Fetch the fill status of a resting (LIMIT/GTC) close order.
+ */
+export async function getOrderStatus(orderId: string): Promise<{
+  filled: boolean;
+  sizeMatched: number;
+  avgPrice?: number;
+}> {
+  const client = getClobClient();
+  const order = await client.getOrder(orderId) as unknown as Record<string, unknown>;
+  const originalSize  = Number(order["original_size"]  ?? order["size"]         ?? 0);
+  const sizeMatched   = Number(order["size_matched"]    ?? order["filled_size"]  ?? 0);
+  const avgPrice      = order["avg_price"] != null ? Number(order["avg_price"]) : undefined;
+  return {
+    filled: originalSize > 0 && sizeMatched >= originalSize,
+    sizeMatched,
+    avgPrice,
+  };
+}
+
+/**
+ * Cancel a resting order by ID.
+ */
+export async function cancelOrder(orderId: string): Promise<void> {
+  const client = getClobClient();
+  await client.cancelOrder({ orderID: orderId });
 }
