@@ -15,7 +15,7 @@ import { trackMarket, untrackMarket, setActiveBetPriceCallback } from "./scanner
 import { getTokenPrice } from "./websocket.js";
 import { simulateBet } from "./shadow.js";
 import { enqueueRedemption } from "./redemptionQueue.js";
-import type { Market, ActiveBet, BetRule, OrderResult } from "./types.js";
+import type { Market, ActiveBet, BetRule } from "./types.js";
 import type { TokenPrice } from "./websocket.js";
 
 const activeBetsByMarketId = new Map<string, ActiveBet>();
@@ -146,24 +146,9 @@ async function handleShadowBet(
 async function handleLiveBet(
   market: Market, slotId: number, stakeUsd: number, rule: BetRule
 ): Promise<void> {
-  let result: OrderResult | null = null;
+  const result = await placeOrder(market, stakeUsd);
 
-  for (let attempt = 0; attempt <= CONFIG.orderFokRetries; attempt++) {
-    if (attempt > 0) {
-      await sleep(CONFIG.orderFokRetryDelayMs);
-    }
-    result = await placeOrder(market, stakeUsd);
-    if (result.success) break;
-    if (attempt < CONFIG.orderFokRetries) {
-      log.warn("ORDER_FOK_RETRY", {
-        slotId, marketId: market.id, rule,
-        attempt: attempt + 1, maxRetries: CONFIG.orderFokRetries,
-        error: result.error,
-      });
-    }
-  }
-
-  if (!result?.success) {
+  if (!result.success) {
     log.error("ORDER_FAILED", { slotId, marketId: market.id, error: result?.error, rule });
     releaseSlot(slotId);
     untrackMarket(market.id);
@@ -325,37 +310,19 @@ async function handleEarlyClose(bet: ActiveBet, type: "TP" | "SL", exitBid: numb
   if (!bet.shadow) {
     // ── Live mode ──────────────────────────────────────────────────────────
     if (CONFIG.earlyCloseOrderType === "FOK") {
-      // Retry loop: each attempt refreshes the current bid price.
-      let result: OrderResult | null = null;
-      let lastBid = exitBid;
+      const result = await closePosition(bet, exitBid, "FOK");
 
-      for (let attempt = 0; attempt <= CONFIG.earlyCloseFokRetries; attempt++) {
-        if (attempt > 0) {
-          await sleep(CONFIG.earlyCloseFokRetryDelayMs);
-          // Refresh bid between retries — market may have moved.
-          lastBid = getTokenPrice(bet.market.tokenIdToBuy)?.bestBid ?? lastBid;
-        }
-
-        result = await closePosition(bet, lastBid, "FOK");
-        if (result.success) break;
-
-        log.warn("EARLY_CLOSE_FOK_RETRY", {
-          betId: bet.betId, attempt: attempt + 1,
-          maxRetries: CONFIG.earlyCloseFokRetries,
-          error: result.error,
-        });
-      }
-
-      if (!result?.success) {
-        log.warn("EARLY_CLOSE_EXHAUSTED", {
+      if (!result.success) {
+        log.warn("EARLY_CLOSE_FAILED", {
           betId: bet.betId, marketId: bet.market.id, type,
-          message: "All FOK retries exhausted — letting market resolve naturally.",
+          error: result.error,
+          message: "FOK close rejected — will retry on next price update.",
         });
         closingMarketIds.delete(bet.market.id);
         return;
       }
 
-      proceeds = Math.round(sharesOwned * (result.avgPrice ?? lastBid) * 100) / 100;
+      proceeds = Math.round(sharesOwned * (result.avgPrice ?? exitBid) * 100) / 100;
 
     } else {
       // LIMIT (GTC) path

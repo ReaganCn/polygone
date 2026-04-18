@@ -146,28 +146,19 @@ export interface BotConfig {
   // When enabled, the bot monitors the bid price of every held token via
   // WebSocket and closes the position before market expiry.
   earlyCloseEnabled: boolean;
-  // "FOK" = Fill-Or-Kill sell with up to earlyCloseFokRetries retries.
+  // "FOK" = Fill-Or-Kill sell (rejected orders auto-retry on next price update).
   // "LIMIT" = GTC sell, waits for fill until market expires then cancels.
   earlyCloseOrderType: EarlyCloseOrderTypeOption;
   // Take profit: close when position P&L reaches this % gain (e.g. 30 = +30%).
   earlyCloseTakeProfitPercent: number;
   // Stop loss: close when position P&L drops to this % loss (e.g. 10 = -10%).
   earlyCloseStopLossPercent: number;
-  // How many times to retry a failed FOK close (FOK mode only).
-  earlyCloseFokRetries: number;
-  // Milliseconds to wait between FOK retries (FOK mode only).
-  earlyCloseFokRetryDelayMs: number;
   // Maximum number of total early-close invocations per bet before giving up
   // and letting the market resolve naturally. Prevents infinite retry loops.
   earlyCloseMaxAttempts: number;
   // ──────────────────────────────────────────────────────────────────────────
 
-  // ── Initial order FOK retries ─────────────────────────────────────────────
-  // How many times to retry a rejected FOK BUY order before abandoning the bet.
-  orderFokRetries: number;
-  // Milliseconds to wait between FOK BUY retries.
-  orderFokRetryDelayMs: number;
-  // ──────────────────────────────────────────────────────────────────────────
+
 }
 
 function loadConfig(): BotConfig {
@@ -240,11 +231,7 @@ function loadConfig(): BotConfig {
     })(),
     earlyCloseTakeProfitPercent: parseFloat_("EARLY_CLOSE_TP_PERCENT",        30),
     earlyCloseStopLossPercent:   parseFloat_("EARLY_CLOSE_SL_PERCENT",        10),
-    earlyCloseFokRetries:        parseInt_("EARLY_CLOSE_FOK_RETRIES",         3),
-    earlyCloseFokRetryDelayMs:   parseInt_("EARLY_CLOSE_FOK_RETRY_DELAY_MS", 1000),
     earlyCloseMaxAttempts:       parseInt_("EARLY_CLOSE_MAX_ATTEMPTS",        3),
-    orderFokRetries:             parseInt_("ORDER_FOK_RETRIES",               3),
-    orderFokRetryDelayMs:        parseInt_("ORDER_FOK_RETRY_DELAY_MS",        1000),
   };
 }
 
@@ -279,11 +266,7 @@ export type MutableConfigKeys =
   | "earlyCloseOrderType"
   | "earlyCloseTakeProfitPercent"
   | "earlyCloseStopLossPercent"
-  | "earlyCloseFokRetries"
-  | "earlyCloseFokRetryDelayMs"
-  | "earlyCloseMaxAttempts"
-  | "orderFokRetries"
-  | "orderFokRetryDelayMs";
+  | "earlyCloseMaxAttempts";
 
 const KEY_TYPES: Record<MutableConfigKeys, "number" | "integer" | "boolean" | "string" | "stringArray" | "orderType" | "closeOrderType" | "numberOrNull"> = {
   scanIntervalMs:           "integer",
@@ -314,11 +297,7 @@ const KEY_TYPES: Record<MutableConfigKeys, "number" | "integer" | "boolean" | "s
   earlyCloseOrderType:         "closeOrderType",
   earlyCloseTakeProfitPercent: "number",
   earlyCloseStopLossPercent:   "number",
-  earlyCloseFokRetries:        "integer",
-  earlyCloseFokRetryDelayMs:   "integer",
   earlyCloseMaxAttempts:       "integer",
-  orderFokRetries:             "integer",
-  orderFokRetryDelayMs:        "integer",
 };
 
 export const CONFIG: BotConfig = loadConfig();
