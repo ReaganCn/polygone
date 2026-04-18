@@ -135,6 +135,12 @@ export interface BotConfig {
   //   dailyLossLimit:    pause when today's net P&L <= -this value (stored positive).
   dailyProfitTarget: number | null;
   dailyLossLimit: number | null;
+  // Reset all slots to initial capital at UTC midnight.
+  midnightSlotReset: boolean;
+  // Periodic Telegram status snapshot.
+  statusSnapshotEnabled: boolean;
+  // How many hours between each snapshot (e.g. 1 = every hour, 4 = every 4h).
+  statusSnapshotIntervalHours: number;
   // ──────────────────────────────────────────────────────────────────────────
 
   // ── Telegram alerts ─────────────────────────────────────────────────────
@@ -220,6 +226,9 @@ function loadConfig(): BotConfig {
       ? parseFloat_("DAILY_PROFIT_TARGET", 0) : null,
     dailyLossLimit: process.env["DAILY_LOSS_LIMIT"]
       ? parseFloat_("DAILY_LOSS_LIMIT", 0) : null,
+    midnightSlotReset:           parseBool("MIDNIGHT_SLOT_RESET",            true),
+    statusSnapshotEnabled:       parseBool("STATUS_SNAPSHOT_ENABLED",        false),
+    statusSnapshotIntervalHours: parseFloat_("STATUS_SNAPSHOT_INTERVAL_HOURS", 1),
 
     telegramBotToken: optionalEnv("TELEGRAM_BOT_TOKEN", ""),
     telegramChatId:   optionalEnv("TELEGRAM_CHAT_ID", ""),
@@ -262,6 +271,9 @@ export type MutableConfigKeys =
   | "tradingEndTime"
   | "dailyProfitTarget"
   | "dailyLossLimit"
+  | "midnightSlotReset"
+  | "statusSnapshotEnabled"
+  | "statusSnapshotIntervalHours"
   | "earlyCloseEnabled"
   | "earlyCloseOrderType"
   | "earlyCloseTakeProfitPercent"
@@ -293,6 +305,9 @@ const KEY_TYPES: Record<MutableConfigKeys, "number" | "integer" | "boolean" | "s
   tradingEndTime:           "string",
   dailyProfitTarget:        "numberOrNull",
   dailyLossLimit:           "numberOrNull",
+  midnightSlotReset:           "boolean",
+  statusSnapshotEnabled:       "boolean",
+  statusSnapshotIntervalHours: "number",
   earlyCloseEnabled:           "boolean",
   earlyCloseOrderType:         "closeOrderType",
   earlyCloseTakeProfitPercent: "number",

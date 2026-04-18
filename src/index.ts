@@ -102,6 +102,7 @@ async function main(): Promise<void> {
 
 let lastSeenUtcDate = new Date().getUTCDate();
 let pendingFinalPauseMessage = false;
+let lastSnapshotHour = -1;
 
 function supervisorTick(): void {
   const summary = getSummary();
@@ -112,31 +113,53 @@ function supervisorTick(): void {
   if (todayUtcDate !== lastSeenUtcDate) {
     lastSeenUtcDate = todayUtcDate;
 
-    // Reset slots first so summary reflects fresh day values.
-    resetSlots();
-    dailyState.startOfDayPnl = 0;
-
-    // Clean up old log files (>24 hours)
+    // Clean up old log files (>24 hours) regardless of reset setting
     log.cleanup(24 * 60 * 60 * 1000);
 
-    // Send new-day reset summary (values should be reset for the day).
-    const resetSummary = getSummary();
-    const resetMessage = formatStatusMessage(resetSummary, {
-      tradingWindowStart: CONFIG.tradingStartTime,
-      tradingWindowEnd: CONFIG.tradingEndTime,
-      dailyNetPnl: 0,
-      dailyProfitTarget: CONFIG.dailyProfitTarget,
-      dailyLossLimit: CONFIG.dailyLossLimit,
-    }, {
-      paused: isPausedState(),
-      shadowMode: CONFIG.shadowMode,
-    });
-    sendTelegramAlert(resetMessage).catch(() => {});
-    pendingFinalPauseMessage = false;
+    if (CONFIG.midnightSlotReset) {
+      // Reset slots first so summary reflects fresh day values.
+      resetSlots();
+      dailyState.startOfDayPnl = 0;
 
-    log.info("INFO", { message: "UTC midnight — daily reset complete. Slots, PnL, trades zeroed." });
+      // Send new-day reset summary (values should be reset for the day).
+      const resetSummary = getSummary();
+      const resetMessage = formatStatusMessage(resetSummary, {
+        tradingWindowStart: CONFIG.tradingStartTime,
+        tradingWindowEnd: CONFIG.tradingEndTime,
+        dailyNetPnl: 0,
+        dailyProfitTarget: CONFIG.dailyProfitTarget,
+        dailyLossLimit: CONFIG.dailyLossLimit,
+      }, {
+        paused: isPausedState(),
+        shadowMode: CONFIG.shadowMode,
+      });
+      sendTelegramAlert(resetMessage).catch(() => {});
+      pendingFinalPauseMessage = false;
+
+      log.info("INFO", { message: "UTC midnight — daily reset complete. Slots and PnL zeroed." });
+    }
   }
 
+  // ── Periodic status snapshot ────────────────────────────────────────────
+  if (CONFIG.statusSnapshotEnabled) {
+    const nowHour = Math.floor(Date.now() / (CONFIG.statusSnapshotIntervalHours * 60 * 60 * 1000));
+    if (nowHour !== lastSnapshotHour) {
+      lastSnapshotHour = nowHour;
+      const snapSummary = getSummary();
+      const snapNetPnl  = round2(snapSummary.totalProfitExtracted - snapSummary.totalLost);
+      const snapPnlToday = round2(snapNetPnl - dailyState.startOfDayPnl);
+      const snapMessage = formatStatusMessage(snapSummary, {
+        tradingWindowStart: CONFIG.tradingStartTime,
+        tradingWindowEnd: CONFIG.tradingEndTime,
+        dailyNetPnl: snapPnlToday,
+        dailyProfitTarget: CONFIG.dailyProfitTarget,
+        dailyLossLimit: CONFIG.dailyLossLimit,
+      }, { paused: isPausedState(), shadowMode: CONFIG.shadowMode });
+      sendTelegramAlert(snapMessage).catch(() => {});
+    }
+  }
+
+  // ── Pause / resume logic ─────────────────────────────────────────────────
   // Recompute after potential reset
   const summaryNow = getSummary();
   const netPnlNow = round2(summaryNow.totalProfitExtracted - summaryNow.totalLost);
