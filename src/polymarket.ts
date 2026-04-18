@@ -438,8 +438,8 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
       );
     } else {
       // GTC/GTD: limit order
-      // BUG 3 FIX: Use correctly validated size
-      const sizeShares = roundSizeForPrecision(stakeUsd / price, price);
+      // BUG 3 FIX: Use correctly validated size, enforcing Polymarket's $1 minimum.
+      const sizeShares = roundSizeForPrecision(stakeUsd / price, price, 1.0);
 
       resp = await client.createAndPostOrder(
         {
@@ -456,12 +456,17 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
     const r = resp as Record<string, unknown>;
 
     const errorMsg = r["errorMsg"] ?? r["error"];
-    const status = r["status"] as string | undefined;
+    const status = r["status"] as string | number | undefined;
     const orderId = (r["orderId"] ?? r["id"] ?? r["orderID"] ?? "") as string;
+    // The CLOB client's http-helpers catches HTTP 4xx errors and returns
+    // { error: "...", orderID: "0x...", status: 400 } — the orderID is present
+    // even on FOK rejection, so !orderId cannot detect failure. Check the error
+    // message directly OR a numeric/string status that signals rejection.
     const isRejected =
-      (typeof errorMsg === "string" && errorMsg.length > 0 && !orderId) ||
+      (typeof errorMsg === "string" && errorMsg.length > 0) ||
       status === "rejected" ||
-      status === "error";
+      status === "error" ||
+      (typeof status === "number" && status >= 400);
 
     if (isRejected) {
       const errorText = String(errorMsg ?? status ?? "Order rejected by CLOB");
@@ -504,8 +509,10 @@ export async function placeOrder(market: Market, stakeUsd: number): Promise<Orde
 
 /**
  * BUG 3 FIX: Round share size so that size × price has at most 2 decimal places.
+ * @param minProductUsd  When > 0, ensures size × price >= this value after rounding
+ *                       (use 1.0 for BUY orders to satisfy Polymarket's $1 minimum).
  */
-function roundSizeForPrecision(rawSize: number, price: number): number {
+function roundSizeForPrecision(rawSize: number, price: number, minProductUsd = 0): number {
   let size = Math.floor(rawSize * 10000) / 10000;
 
   for (let i = 0; i < 200; i++) {
@@ -518,6 +525,14 @@ function roundSizeForPrecision(rawSize: number, price: number): number {
 
     size = Math.floor((size - 0.0001) * 10000) / 10000;
     if (size <= 0) { size = 0.0001; break; }
+  }
+
+  // The precision loop rounds down, which can push size × price below the
+  // exchange minimum. Step back up one tick at a time until the floor is met.
+  if (minProductUsd > 0) {
+    while (size * price < minProductUsd) {
+      size = Math.round((size + 0.0001) * 10000) / 10000;
+    }
   }
 
   return size;
@@ -577,12 +592,13 @@ export async function closePosition(
 
     const r = resp as Record<string, unknown>;
     const errorMsg = r["errorMsg"] ?? r["error"];
-    const status   = r["status"] as string | undefined;
+    const status   = r["status"] as string | number | undefined;
     const orderId  = (r["orderId"] ?? r["id"] ?? r["orderID"] ?? "") as string;
     const isRejected =
-      (typeof errorMsg === "string" && errorMsg.length > 0 && !orderId) ||
+      (typeof errorMsg === "string" && errorMsg.length > 0) ||
       status === "rejected" ||
-      status === "error";
+      status === "error" ||
+      (typeof status === "number" && status >= 400);
 
     if (isRejected) {
       const errorText = String(errorMsg ?? status ?? "Close order rejected by CLOB");

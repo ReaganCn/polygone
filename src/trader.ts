@@ -15,13 +15,21 @@ import { trackMarket, untrackMarket, setActiveBetPriceCallback } from "./scanner
 import { getTokenPrice } from "./websocket.js";
 import { simulateBet } from "./shadow.js";
 import { enqueueRedemption } from "./redemptionQueue.js";
-import type { Market, ActiveBet, BetRule } from "./types.js";
+import type { Market, ActiveBet, BetRule, OrderResult } from "./types.js";
 import type { TokenPrice } from "./websocket.js";
 
 const activeBetsByMarketId = new Map<string, ActiveBet>();
 
 /** Prevents concurrent early-close attempts for the same market. */
 const closingMarketIds = new Set<string>();
+
+/**
+ * Counts how many times an early-close has been attempted for each market.
+ * Attempts are reset when a bet is resolved. Once the count reaches
+ * CONFIG.earlyCloseMaxAttempts, further close attempts are suppressed and
+ * the position falls through to natural market resolution.
+ */
+const closeAttemptsByMarketId = new Map<string, number>();
 
 /**
  * Wire up the early-close price callback from scanner.
@@ -118,6 +126,7 @@ export function handleWsResolution(
   }
 
   activeBetsByMarketId.delete(marketId);
+  closeAttemptsByMarketId.delete(marketId);
   untrackMarket(marketId);
 }
 
@@ -137,10 +146,25 @@ async function handleShadowBet(
 async function handleLiveBet(
   market: Market, slotId: number, stakeUsd: number, rule: BetRule
 ): Promise<void> {
-  const result = await placeOrder(market, stakeUsd);
+  let result: OrderResult | null = null;
 
-  if (!result.success) {
-    log.error("ORDER_FAILED", { slotId, marketId: market.id, error: result.error, rule });
+  for (let attempt = 0; attempt <= CONFIG.orderFokRetries; attempt++) {
+    if (attempt > 0) {
+      await sleep(CONFIG.orderFokRetryDelayMs);
+    }
+    result = await placeOrder(market, stakeUsd);
+    if (result.success) break;
+    if (attempt < CONFIG.orderFokRetries) {
+      log.warn("ORDER_FOK_RETRY", {
+        slotId, marketId: market.id, rule,
+        attempt: attempt + 1, maxRetries: CONFIG.orderFokRetries,
+        error: result.error,
+      });
+    }
+  }
+
+  if (!result?.success) {
+    log.error("ORDER_FAILED", { slotId, marketId: market.id, error: result?.error, rule });
     releaseSlot(slotId);
     untrackMarket(market.id);
     return;
@@ -206,6 +230,7 @@ function startFallbackResolutionWatcher(bet: ActiveBet): void {
             marketId: bet.market.id, outcome: "CANCELLED",
           });
           activeBetsByMarketId.delete(bet.market.id);
+          closeAttemptsByMarketId.delete(bet.market.id);
           recordLoss(bet.slotId);
           untrackMarket(bet.market.id);
         } else {
@@ -262,16 +287,23 @@ function checkEarlyCloseForBet(marketId: string, tokenId: string, price: TokenPr
 
   if (currentBid <= 0) return;
 
-  // Thresholds are relative to the bid price at entry, not the ask.
-  // This avoids instant SL triggers caused by the natural bid-ask spread.
-  const tp = bet.bidPriceAtBet + CONFIG.earlyCloseTakeProfitDelta;
-  const sl = bet.bidPriceAtBet - CONFIG.earlyCloseStopLossDelta;
+  // Suppress further close attempts once the configured maximum is reached.
+  // This prevents an infinite retry loop when every attempt is rejected
+  // (e.g. no liquidity). The position then falls through to natural resolution.
+  const attempts = closeAttemptsByMarketId.get(marketId) ?? 0;
+  if (attempts >= CONFIG.earlyCloseMaxAttempts) return;
 
-  if (currentBid >= tp) {
+  // Calculate current position P&L as a % of the original stake.
+  // priceAtBet is the ask price paid, so this reflects the true return on capital.
+  const shares = bet.stakeUsd / bet.priceAtBet;
+  const currentValue = shares * currentBid;
+  const pnlPct = ((currentValue - bet.stakeUsd) / bet.stakeUsd) * 100;
+
+  if (pnlPct >= CONFIG.earlyCloseTakeProfitPercent) {
     handleEarlyClose(bet, "TP", currentBid).catch((err) =>
       log.error("EARLY_CLOSE_ERROR", { betId: bet.betId, type: "TP", error: (err as Error).message })
     );
-  } else if (currentBid <= sl) {
+  } else if (pnlPct <= -CONFIG.earlyCloseStopLossPercent) {
     handleEarlyClose(bet, "SL", currentBid).catch((err) =>
       log.error("EARLY_CLOSE_ERROR", { betId: bet.betId, type: "SL", error: (err as Error).message })
     );
@@ -279,8 +311,13 @@ function checkEarlyCloseForBet(marketId: string, tokenId: string, price: TokenPr
 }
 
 async function handleEarlyClose(bet: ActiveBet, type: "TP" | "SL", exitBid: number): Promise<void> {
-  // Synchronous guard — must happen before any await to block concurrent triggers.
+  // Synchronous guards — must happen before any await to block concurrent triggers.
   closingMarketIds.add(bet.market.id);
+  // Increment attempt counter in the same synchronous frame.
+  closeAttemptsByMarketId.set(
+    bet.market.id,
+    (closeAttemptsByMarketId.get(bet.market.id) ?? 0) + 1
+  );
 
   const sharesOwned = bet.stakeUsd / bet.priceAtBet;
   let proceeds = Math.round(sharesOwned * exitBid * 100) / 100;
@@ -289,7 +326,7 @@ async function handleEarlyClose(bet: ActiveBet, type: "TP" | "SL", exitBid: numb
     // ── Live mode ──────────────────────────────────────────────────────────
     if (CONFIG.earlyCloseOrderType === "FOK") {
       // Retry loop: each attempt refreshes the current bid price.
-      let result: { success: boolean; avgPrice?: number; error?: string } | null = null;
+      let result: OrderResult | null = null;
       let lastBid = exitBid;
 
       for (let attempt = 0; attempt <= CONFIG.earlyCloseFokRetries; attempt++) {
@@ -361,23 +398,24 @@ async function handleEarlyClose(bet: ActiveBet, type: "TP" | "SL", exitBid: numb
 
   // ── Cleanup ────────────────────────────────────────────────────────────────
   activeBetsByMarketId.delete(bet.market.id);
+  closeAttemptsByMarketId.delete(bet.market.id);
   // Do NOT call untrackMarket here. Keeping the market in trackedMarketIds
   // prevents the scanner from immediately firing a new bet on the same market
   // (the slot just freed up). The scanner prunes it from knownMarkets ~30s
   // after closesAt, which also cleans it from trackedMarketIds.
   closingMarketIds.delete(bet.market.id);
 
-  const configuredDelta = type === "TP"
-    ? CONFIG.earlyCloseTakeProfitDelta
-    : CONFIG.earlyCloseStopLossDelta;
+  const thresholdPct = type === "TP" ? CONFIG.earlyCloseTakeProfitPercent : CONFIG.earlyCloseStopLossPercent;
   const logKey = type === "TP" ? "EARLY_CLOSE_TP" : "EARLY_CLOSE_SL";
+  const pnlPct = Math.round(((proceeds - bet.stakeUsd) / bet.stakeUsd) * 10000) / 100;
   log.info(logKey, {
     betId: bet.betId, marketId: bet.market.id,
     question: bet.market.question,
     asset: bet.market.asset, side: bet.side, rule: bet.rule,
-    bidPriceAtBet: bet.bidPriceAtBet, priceAtBet: bet.priceAtBet, exitBid,
-    configuredDelta, threshold: Math.round((bet.bidPriceAtBet + (type === "TP" ? configuredDelta : -configuredDelta)) * 1000) / 1000,
+    priceAtBet: bet.priceAtBet, exitBid,
+    thresholdPct: `${type === "TP" ? "+" : "-"}${thresholdPct}%`,
     stakeUsd: bet.stakeUsd, proceeds, pnlUsd,
+    pnlPct: `${pnlPct >= 0 ? "+" : ""}${pnlPct}%`,
     orderType: CONFIG.earlyCloseOrderType, shadow: bet.shadow,
   });
 }

@@ -149,14 +149,24 @@ export interface BotConfig {
   // "FOK" = Fill-Or-Kill sell with up to earlyCloseFokRetries retries.
   // "LIMIT" = GTC sell, waits for fill until market expires then cancels.
   earlyCloseOrderType: EarlyCloseOrderTypeOption;
-  // Take profit: close when current bid rises by this delta above entry price.
-  earlyCloseTakeProfitDelta: number;
-  // Stop loss: close when current bid falls by this delta below entry price.
-  earlyCloseStopLossDelta: number;
+  // Take profit: close when position P&L reaches this % gain (e.g. 30 = +30%).
+  earlyCloseTakeProfitPercent: number;
+  // Stop loss: close when position P&L drops to this % loss (e.g. 10 = -10%).
+  earlyCloseStopLossPercent: number;
   // How many times to retry a failed FOK close (FOK mode only).
   earlyCloseFokRetries: number;
   // Milliseconds to wait between FOK retries (FOK mode only).
   earlyCloseFokRetryDelayMs: number;
+  // Maximum number of total early-close invocations per bet before giving up
+  // and letting the market resolve naturally. Prevents infinite retry loops.
+  earlyCloseMaxAttempts: number;
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // ── Initial order FOK retries ─────────────────────────────────────────────
+  // How many times to retry a rejected FOK BUY order before abandoning the bet.
+  orderFokRetries: number;
+  // Milliseconds to wait between FOK BUY retries.
+  orderFokRetryDelayMs: number;
   // ──────────────────────────────────────────────────────────────────────────
 }
 
@@ -222,16 +232,20 @@ function loadConfig(): BotConfig {
 
     telegramBotToken: optionalEnv("TELEGRAM_BOT_TOKEN", ""),
     telegramChatId:   optionalEnv("TELEGRAM_CHAT_ID", ""),
-    earlyCloseEnabled:          parseBool("EARLY_CLOSE_ENABLED", false),
-    earlyCloseOrderType:        (() => {
+    earlyCloseEnabled:           parseBool("EARLY_CLOSE_ENABLED", false),
+    earlyCloseOrderType:         (() => {
       const v = optionalEnv("EARLY_CLOSE_ORDER_TYPE", "FOK").toUpperCase();
       if (v !== "FOK" && v !== "LIMIT") throw new Error(`EARLY_CLOSE_ORDER_TYPE must be FOK or LIMIT, got: ${v}`);
       return v as EarlyCloseOrderTypeOption;
     })(),
-    earlyCloseTakeProfitDelta:  parseFloat_("EARLY_CLOSE_TP_DELTA",            0.06),
-    earlyCloseStopLossDelta:    parseFloat_("EARLY_CLOSE_SL_DELTA",            0.03),
-    earlyCloseFokRetries:       parseInt_("EARLY_CLOSE_FOK_RETRIES",           3),
-    earlyCloseFokRetryDelayMs:  parseInt_("EARLY_CLOSE_FOK_RETRY_DELAY_MS",   1000),  };
+    earlyCloseTakeProfitPercent: parseFloat_("EARLY_CLOSE_TP_PERCENT",        30),
+    earlyCloseStopLossPercent:   parseFloat_("EARLY_CLOSE_SL_PERCENT",        10),
+    earlyCloseFokRetries:        parseInt_("EARLY_CLOSE_FOK_RETRIES",         3),
+    earlyCloseFokRetryDelayMs:   parseInt_("EARLY_CLOSE_FOK_RETRY_DELAY_MS", 1000),
+    earlyCloseMaxAttempts:       parseInt_("EARLY_CLOSE_MAX_ATTEMPTS",        3),
+    orderFokRetries:             parseInt_("ORDER_FOK_RETRIES",               3),
+    orderFokRetryDelayMs:        parseInt_("ORDER_FOK_RETRY_DELAY_MS",        1000),
+  };
 }
 
 // ─── mutable keys ─────────────────────────────────────────────────────────────
@@ -263,10 +277,13 @@ export type MutableConfigKeys =
   | "dailyLossLimit"
   | "earlyCloseEnabled"
   | "earlyCloseOrderType"
-  | "earlyCloseTakeProfitDelta"
-  | "earlyCloseStopLossDelta"
+  | "earlyCloseTakeProfitPercent"
+  | "earlyCloseStopLossPercent"
   | "earlyCloseFokRetries"
-  | "earlyCloseFokRetryDelayMs";
+  | "earlyCloseFokRetryDelayMs"
+  | "earlyCloseMaxAttempts"
+  | "orderFokRetries"
+  | "orderFokRetryDelayMs";
 
 const KEY_TYPES: Record<MutableConfigKeys, "number" | "integer" | "boolean" | "string" | "stringArray" | "orderType" | "closeOrderType" | "numberOrNull"> = {
   scanIntervalMs:           "integer",
@@ -293,12 +310,15 @@ const KEY_TYPES: Record<MutableConfigKeys, "number" | "integer" | "boolean" | "s
   tradingEndTime:           "string",
   dailyProfitTarget:        "numberOrNull",
   dailyLossLimit:           "numberOrNull",
-  earlyCloseEnabled:          "boolean",
-  earlyCloseOrderType:        "closeOrderType",
-  earlyCloseTakeProfitDelta:  "number",
-  earlyCloseStopLossDelta:    "number",
-  earlyCloseFokRetries:       "integer",
-  earlyCloseFokRetryDelayMs:  "integer",
+  earlyCloseEnabled:           "boolean",
+  earlyCloseOrderType:         "closeOrderType",
+  earlyCloseTakeProfitPercent: "number",
+  earlyCloseStopLossPercent:   "number",
+  earlyCloseFokRetries:        "integer",
+  earlyCloseFokRetryDelayMs:   "integer",
+  earlyCloseMaxAttempts:       "integer",
+  orderFokRetries:             "integer",
+  orderFokRetryDelayMs:        "integer",
 };
 
 export const CONFIG: BotConfig = loadConfig();
