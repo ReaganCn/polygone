@@ -280,7 +280,17 @@ export type MutableConfigKeys =
   | "earlyCloseStopLossPercent"
   | "earlyCloseMaxAttempts";
 
-const KEY_TYPES: Record<MutableConfigKeys, "number" | "integer" | "boolean" | "string" | "stringArray" | "orderType" | "closeOrderType" | "numberOrNull"> = {
+const KEY_TYPES: Record<
+  MutableConfigKeys,
+  | "number"
+  | "integer"
+  | "boolean"
+  | "string"
+  | "stringArray"
+  | "orderType"
+  | "closeOrderType"
+  | "numberOrNull"
+> = {
   scanIntervalMs:           "integer",
   enable5m:                 "boolean",
   enable15m:                "boolean",
