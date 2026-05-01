@@ -140,6 +140,9 @@ export function startApiServer(): void {
           "shadowMode", "targetAssets",
           "tradingStartTime", "tradingEndTime",
           "dailyProfitTarget", "dailyLossLimit",
+          "midnightSlotReset", "statusSnapshotEnabled", "statusSnapshotIntervalHours",
+          "earlyCloseEnabled", "earlyCloseOrderType",
+          "earlyCloseTakeProfitPercent", "earlyCloseStopLossPercent", "earlyCloseMaxAttempts",
         ],
         examples: {
           "set trading hours":         { tradingStartTime: "09:00", tradingEndTime: "17:00" },
